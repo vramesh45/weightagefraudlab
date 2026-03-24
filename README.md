@@ -2,7 +2,7 @@
 
 A comprehensive risk analytics platform featuring credit risk modeling, fraud detection, VC analytics, and forensic audit capabilities.
 
-🔗 **Live Demo**: [https://yourusername.github.io/weightage-labs](https://yourusername.github.io/weightage-labs)
+🔗 **Live Demo**: [https://vramesh45.github.io/weightage-labs](https://vramesh45.github.io/weightage-labs)
 
 ---
 
