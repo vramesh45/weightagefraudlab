@@ -57,10 +57,10 @@ A comprehensive risk analytics platform featuring credit risk modeling, fraud de
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/weightage-labs.git
+git clone https://github.com/vramesh45/weightagefraudlab.git
 
 # Navigate to the directory
-cd weightage-labs
+cd weightagefraudlab
 
 # Open in browser (option 1: direct)
 open index.html
@@ -75,12 +75,11 @@ npx serve .
 
 ### Deployment to GitHub Pages
 
-1. Fork or clone this repository
-2. Go to **Settings** → **Pages**
-3. Under **Source**, select **Deploy from a branch**
-4. Select branch: `main`, folder: `/ (root)`
-5. Click **Save**
-6. Your site will be live at: `https://yourusername.github.io/weightage-labs`
+1. Go to **Settings** → **Pages**
+2. Under **Source**, select **Deploy from a branch**
+3. Select branch: `main`, folder: `/ (root)`
+4. Click **Save**
+5. Your site will be live at: `https://vramesh45.github.io/weightagefraudlab`
 
 ---
 
