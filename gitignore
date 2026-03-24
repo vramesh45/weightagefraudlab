@@ -1,0 +1,57 @@
+# ── Operating System ──────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+Desktop.ini
+
+# ── Editor / IDE ───────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# ── Temporary Files ────────────────────────────────────────────
+*.tmp
+*.temp
+*.log
+*.bak
+*.backup
+
+# ── Node.js (if you add build tools later) ─────────────────────
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+yarn.lock
+
+# ── Build Outputs ──────────────────────────────────────────────
+# NOTE: *.min.js and *.min.css removed — they would block CDN files
+dist/
+build/
+
+# ── Environment Variables (NEVER commit these) ─────────────────
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# ── Archives ───────────────────────────────────────────────────
+*.zip
+*.tar.gz
+*.rar
+
+# ── Personal Notes ─────────────────────────────────────────────
+notes.txt
+TODO.md
+.notes/

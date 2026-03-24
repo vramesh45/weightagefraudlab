@@ -1,0 +1,2289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Weightage Labs — Risk Intelligence Platform</title>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Sora:wght@400;600;700&display=swap" rel="stylesheet"/>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body { height: 100%; background: #05080f; font-family: 'JetBrains Mono', 'Fira Mono', 'Courier New', monospace; }
+    input[type=range] { height: 3px; }
+    ::-webkit-scrollbar { width: 4px; height: 4px; }
+    ::-webkit-scrollbar-track { background: #080d18; }
+    ::-webkit-scrollbar-thumb { background: #1a2840; border-radius: 2px; }
+    #root { min-height: 100vh; }
+    @media print { .no-print { display: none !important; } }
+    textarea, input { outline: none; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ── DESIGN TOKENS ──────────────────────────────────────────────
+const F  = "'JetBrains Mono','Fira Mono',monospace";
+const FS = "'Sora','Segoe UI',sans-serif";
+const C  = {
+  bg:"#05080f", panel:"#080d18", panel2:"#0b1220", border:"#111c2e",
+  border2:"#1a2840", text:"#c8d8f0", muted:"#3a5070", dim:"#0d1525",
+  white:"#eef4ff", green:"#00e5a0", yellow:"#f0c840", orange:"#f07830",
+  red:"#e83030", blue:"#4a9eff", cyan:"#20d0e0", purple:"#a060ff", gold:"#ffd060",
+};
+
+// ── MATH HELPERS ───────────────────────────────────────────────
+const logistic = z => 1 / (1 + Math.exp(-z));
+const clamp    = (v,lo,hi) => Math.min(hi, Math.max(lo, v));
+const fmt      = (n,d=0) => Number(n).toLocaleString("en-IN",{maximumFractionDigits:d,minimumFractionDigits:d});
+const fmtCr    = v => v>=1e7?`₹${(v/1e7).toFixed(2)}Cr`:v>=1e5?`₹${(v/1e5).toFixed(1)}L`:`₹${fmt(v)}`;
+const pct      = (v,d=2) => `${(v*100).toFixed(d)}%`;
+
+function band(v, cuts, labels, colors) {
+  for (let i=0;i<cuts.length;i++) if(v<cuts[i]) return {label:labels[i],color:colors[i]};
+  return {label:labels[labels.length-1],color:colors[colors.length-1]};
+}
+const pdBand    = v => band(v,[.05,.12,.22,.35,.50],["AAA","AA","A","BBB","BB","B/CCC"],[C.green,C.green,C.yellow,C.orange,C.red,C.red]);
+const lgdBand   = v => band(v,[.30,.45,.58,.72,.85],["Low","Mod-Low","Moderate","High","V.High","Severe"],[C.green,C.green,C.yellow,C.orange,C.red,C.red]);
+const eclBand   = r => band(r,[.01,.03,.08,.18,.35],["Negligible","Low","Moderate","Elevated","High","Critical"],[C.green,C.cyan,C.yellow,C.orange,C.red,C.red]);
+const fraudBand = s => band(s,[20,40,60,80],["Clean","Low","Medium","High","Critical"],[C.green,C.cyan,C.yellow,C.orange,C.red]);
+
+// ── ANIMATION HOOK ─────────────────────────────────────────────
+function useAnim(target, dur=500) {
+  const [v, setV] = useState(target);
+  const ref = useRef(target);
+  useEffect(() => {
+    const s=ref.current, e=target, t0=performance.now();
+    const tick = now => {
+      const t=Math.min((now-t0)/dur,1);
+      const ease=t<.5?2*t*t:-1+(4-2*t)*t;
+      setV(s+(e-s)*ease);
+      if(t<1) requestAnimationFrame(tick); else { setV(e); ref.current=e; }
+    };
+    requestAnimationFrame(tick);
+  }, [target]);
+  return v;
+}
+
+// ── TOOLTIP ────────────────────────────────────────────────────
+function Info({ text }) {
+  const [on, setOn] = useState(false);
+  return (
+    <span style={{position:"relative",display:"inline-block",marginLeft:5}}>
+      <span onMouseEnter={()=>setOn(true)} onMouseLeave={()=>setOn(false)}
+        style={{display:"inline-flex",alignItems:"center",justifyContent:"center",
+          width:13,height:13,background:C.muted+"22",border:`1px solid ${C.muted}44`,
+          borderRadius:"50%",fontSize:8,color:C.muted,cursor:"help",fontWeight:700}}>?</span>
+      {on&&<div style={{position:"absolute",top:16,left:0,background:C.panel2,border:`1px solid ${C.border2}`,
+        borderRadius:8,padding:"10px 13px",fontSize:10,color:C.text,maxWidth:250,zIndex:9999,
+        lineHeight:1.7,boxShadow:"0 8px 32px #000a",minWidth:180,whiteSpace:"normal"}}>{text}</div>}
+    </span>
+  );
+}
+
+// ── SVG CHART COMPONENTS (no external deps) ────────────────────
+function SVGAreaChart({ data, color, height=160 }) {
+  if(!data||data.length<2) return null;
+  const W=500, H=height, PAD={t:8,r:8,b:28,l:48};
+  const vals=data.map(d=>d.value);
+  const min=Math.min(...vals)*0.95, max=Math.max(...vals)*1.05;
+  const sx=i=>(PAD.l + i*(W-PAD.l-PAD.r)/(data.length-1));
+  const sy=v=>(PAD.t + (1-(v-min)/(max-min||1))*(H-PAD.t-PAD.b));
+  const points=data.map((d,i)=>`${sx(i)},${sy(d.value)}`).join(" ");
+  const area=`M${sx(0)},${H-PAD.b} `+data.map((d,i)=>`L${sx(i)},${sy(d.value)}`).join(" ")+` L${sx(data.length-1)},${H-PAD.b} Z`;
+  const [hover,setHover]=useState(null);
+  const yTicks=3;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height}} onMouseLeave={()=>setHover(null)}>
+      <defs><linearGradient id={`ag_${color.slice(1)}`} x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stopColor={color} stopOpacity="0.25"/>
+        <stop offset="100%" stopColor={color} stopOpacity="0"/>
+      </linearGradient></defs>
+      {[0,1,2].map(i=>{
+        const yv=min+(max-min)*i/2, y=sy(yv);
+        return <g key={i}><line x1={PAD.l} x2={W-PAD.r} y1={y} y2={y} stroke={C.border} strokeDasharray="3 3"/>
+          <text x={PAD.l-4} y={y+3} textAnchor="end" fill={C.muted} fontSize={9} fontFamily={F}>{fmtCr(yv)}</text></g>;
+      })}
+      {data.filter((_,i)=>i%(Math.ceil(data.length/4))===0).map((d,_,arr,i2=data.indexOf(d))=>(
+        <text key={i2} x={sx(i2)} y={H-4} textAnchor="middle" fill={C.muted} fontSize={8} fontFamily={F}>{d.qtr||d.label||""}</text>
+      ))}
+      <path d={area} fill={`url(#ag_${color.slice(1)})`}/>
+      <polyline points={points} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round"/>
+      {data.map((d,i)=>(
+        <circle key={i} cx={sx(i)} cy={sy(d.value)} r={hover===i?5:0} fill={color}
+          onMouseEnter={()=>setHover(i)} style={{cursor:"crosshair"}}/>
+      ))}
+      {data.map((d,i)=>(
+        <rect key={i} x={sx(i)-16} y={0} width={32} height={H} fill="transparent"
+          onMouseEnter={()=>setHover(i)} onMouseLeave={()=>setHover(null)}/>
+      ))}
+      {hover!==null&&<g>
+        <line x1={sx(hover)} x2={sx(hover)} y1={PAD.t} y2={H-PAD.b} stroke={color} strokeDasharray="3 3" opacity={.5}/>
+        <rect x={sx(hover)+4} y={sy(data[hover].value)-22} width={80} height={20} rx={4} fill={C.panel2}/>
+        <text x={sx(hover)+44} y={sy(data[hover].value)-8} textAnchor="middle" fill={color} fontSize={10} fontFamily={F} fontWeight="700">
+          {fmtCr(data[hover].value)}
+        </text>
+      </g>}
+    </svg>
+  );
+}
+
+function SVGBarChart({ data, color, height=160 }) {
+  if(!data||!data.length) return null;
+  const W=500, H=height, PAD={t:8,r:8,b:28,l:48};
+  const vals=data.map(d=>d.value);
+  const max=Math.max(...vals)*1.1||1;
+  const bw=Math.max(4,(W-PAD.l-PAD.r)/data.length*0.6);
+  const sx=i=>PAD.l+(i+0.5)*(W-PAD.l-PAD.r)/data.length;
+  const [hover,setHover]=useState(null);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height}}>
+      {[0,1,2].map(i=>{
+        const yv=max*i/2, y=PAD.t+(1-yv/max)*(H-PAD.t-PAD.b);
+        return <g key={i}><line x1={PAD.l} x2={W-PAD.r} y1={y} y2={y} stroke={C.border} strokeDasharray="3 3"/>
+          <text x={PAD.l-4} y={y+3} textAnchor="end" fill={C.muted} fontSize={9} fontFamily={F}>{fmtCr(yv)}</text></g>;
+      })}
+      {data.map((d,i)=>{
+        const bh=Math.max(2,(d.value/max)*(H-PAD.t-PAD.b));
+        return <g key={i}>
+          <rect x={sx(i)-bw/2} y={H-PAD.b-bh} width={bw} height={bh} rx={2}
+            fill={hover===i?color:color+"bb"} onMouseEnter={()=>setHover(i)} onMouseLeave={()=>setHover(null)} style={{cursor:"crosshair"}}/>
+          {data.length<=8&&<text x={sx(i)} y={H-4} textAnchor="middle" fill={C.muted} fontSize={8} fontFamily={F}>{d.qtr||d.label||""}</text>}
+          {hover===i&&<g>
+            <rect x={sx(i)-38} y={H-PAD.b-bh-22} width={76} height={18} rx={3} fill={C.panel2}/>
+            <text x={sx(i)} y={H-PAD.b-bh-10} textAnchor="middle" fill={color} fontSize={10} fontFamily={F} fontWeight="700">{fmtCr(d.value)}</text>
+          </g>}
+        </g>;
+      })}
+    </svg>
+  );
+}
+
+function SVGLineChart({ data, color, refLine, height=160 }) {
+  if(!data||data.length<2) return null;
+  const W=500, H=height, PAD={t:8,r:8,b:28,l:42};
+  const vals=data.map(d=>d.value);
+  const min=Math.min(...vals)*0.9, max=Math.max(...vals,refLine||0)*1.05;
+  const sx=i=>PAD.l+i*(W-PAD.l-PAD.r)/(data.length-1);
+  const sy=v=>PAD.t+(1-(v-min)/(max-min||1))*(H-PAD.t-PAD.b);
+  const points=data.map((d,i)=>`${sx(i)},${sy(d.value)}`).join(" ");
+  const [hover,setHover]=useState(null);
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height}} onMouseLeave={()=>setHover(null)}>
+      {[0,1,2].map(i=>{
+        const yv=min+(max-min)*i/2, y=sy(yv);
+        return <g key={i}><line x1={PAD.l} x2={W-PAD.r} y1={y} y2={y} stroke={C.border} strokeDasharray="3 3"/>
+          <text x={PAD.l-4} y={y+3} textAnchor="end" fill={C.muted} fontSize={9} fontFamily={F}>{yv.toFixed(1)}x</text></g>;
+      })}
+      {refLine&&<g>
+        <line x1={PAD.l} x2={W-PAD.r} y1={sy(refLine)} y2={sy(refLine)} stroke={C.red} strokeDasharray="4 4"/>
+        <text x={W-PAD.r-2} y={sy(refLine)-4} textAnchor="end" fill={C.red} fontSize={8} fontFamily={F}>Risk {refLine}x</text>
+      </g>}
+      <polyline points={points} fill="none" stroke={color} strokeWidth={2} strokeLinejoin="round"/>
+      {data.map((d,i)=>(
+        <rect key={i} x={sx(i)-16} y={0} width={32} height={H} fill="transparent"
+          onMouseEnter={()=>setHover(i)} onMouseLeave={()=>setHover(null)}/>
+      ))}
+      {hover!==null&&<g>
+        <circle cx={sx(hover)} cy={sy(data[hover].value)} r={4} fill={color}/>
+        <rect x={sx(hover)+4} y={sy(data[hover].value)-20} width={72} height={18} rx={3} fill={C.panel2}/>
+        <text x={sx(hover)+40} y={sy(data[hover].value)-8} textAnchor="middle" fill={color} fontSize={10} fontFamily={F} fontWeight="700">{data[hover].value.toFixed(2)}x</text>
+      </g>}
+    </svg>
+  );
+}
+
+function SVGGroupBar({ data, keys, colors, height=180 }) {
+  if(!data||!data.length) return null;
+  const W=500, H=height, PAD={t:8,r:8,b:28,l:42};
+  const allVals=data.flatMap(d=>keys.map(k=>d[k]||0));
+  const min=Math.min(...allVals), max=Math.max(...allVals)*1.1||1;
+  const hasNeg=min<0;
+  const zero=hasNeg?PAD.t+(1-(0-min)/(max-min))*(H-PAD.t-PAD.b):H-PAD.b;
+  const groupW=(W-PAD.l-PAD.r)/data.length;
+  const bw=Math.min(18,groupW/keys.length*0.7);
+  const gx=i=>PAD.l+i*groupW+groupW/2;
+  return (
+    <svg viewBox={`0 0 ${W} ${H}`} style={{width:"100%",height}}>
+      {[-1,0,1,2].map(i=>{
+        const yv=hasNeg?min+(max-min)*((i+1)/3):max*i/2;
+        const y=PAD.t+(1-(yv-min)/(max-min||1))*(H-PAD.t-PAD.b);
+        return <g key={i}><line x1={PAD.l} x2={W-PAD.r} y1={y} y2={y} stroke={i===0&&hasNeg?C.red:C.border} strokeDasharray={i===0&&hasNeg?"4 4":"3 3"}/>
+          <text x={PAD.l-4} y={y+3} textAnchor="end" fill={C.muted} fontSize={8} fontFamily={F}>{yv.toFixed(1)}</text></g>;
+      })}
+      {data.map((d,i)=>(
+        <g key={i}>
+          {keys.map((k,ki)=>{
+            const v=d[k]||0, yTop=v>=0?PAD.t+(1-(v-min)/(max-min||1))*(H-PAD.t-PAD.b):zero;
+            const bh=Math.abs(v)/(max-min||1)*(H-PAD.t-PAD.b);
+            const x=gx(i)+(ki-(keys.length-1)/2)*(bw+2);
+            return <rect key={ki} x={x-bw/2} y={yTop} width={bw} height={Math.max(2,bh)} rx={2} fill={colors[ki]||C.blue} opacity={.85}/>;
+          })}
+          <text x={gx(i)} y={H-4} textAnchor="middle" fill={C.muted} fontSize={8} fontFamily={F}>{d.phase||d.label||""}</text>
+        </g>
+      ))}
+      {/* Legend */}
+      {keys.map((k,ki)=>(
+        <g key={ki}>
+          <rect x={PAD.l+ki*80} y={4} width={8} height={8} rx={1} fill={colors[ki]}/>
+          <text x={PAD.l+ki*80+12} y={12} fill={C.muted} fontSize={8} fontFamily={F}>{k}</text>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+function SVGRadar({ data, color, size=200 }) {
+  const N=data.length, CX=size/2, CY=size/2, R=size*0.38;
+  const angle=i=>i*2*Math.PI/N - Math.PI/2;
+  const pt=(i,r)=>[CX+r*Math.cos(angle(i)), CY+r*Math.sin(angle(i))];
+  const rings=[.25,.5,.75,1];
+  const polyPoints=data.map((d,i)=>pt(i,(d.A||0)/100*R).join(",")).join(" ");
+  return (
+    <svg width="100%" viewBox={`0 0 ${size} ${size}`} style={{maxHeight:size}}>
+      {rings.map(r=>(
+        <polygon key={r} points={data.map((_,i)=>pt(i,r*R).join(",")).join(" ")} fill="none" stroke={C.border} strokeWidth={r===1?1.5:1}/>
+      ))}
+      {data.map((_,i)=>(
+        <line key={i} x1={CX} y1={CY} x2={pt(i,R)[0]} y2={pt(i,R)[1]} stroke={C.border}/>
+      ))}
+      <polygon points={polyPoints} fill={color} fillOpacity={.2} stroke={color} strokeWidth={2}/>
+      {data.map((d,i)=>{
+        const [px,py]=pt(i,R*1.22);
+        return <text key={i} x={px} y={py+3} textAnchor="middle" fill={C.muted} fontSize={9} fontFamily={F}>{d.subject}</text>;
+      })}
+      {data.map((d,i)=>{
+        const [px,py]=pt(i,(d.A||0)/100*R);
+        return <circle key={i} cx={px} cy={py} r={3} fill={color}/>;
+      })}
+    </svg>
+  );
+}
+
+// ── ATOM COMPONENTS ────────────────────────────────────────────
+function Arc({ value, color, size=110, label, sub }) {
+  const r=44, cx=size/2, cy=size/2, circ=2*Math.PI*r;
+  const a=useAnim(value);
+  return (
+    <svg width={size} height={size} viewBox={`0 0 ${size} ${size}`}>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke={C.dim} strokeWidth={7}/>
+      <circle cx={cx} cy={cy} r={r} fill="none" stroke={color} strokeWidth={7}
+        strokeLinecap="round" strokeDasharray={circ}
+        strokeDashoffset={circ*(1-clamp(Math.abs(a),0,1))}
+        transform={`rotate(-90 ${cx} ${cy})`} style={{transition:"stroke .3s"}}/>
+      <text x={cx} y={cy-3} textAnchor="middle" fill={C.white} fontSize={13} fontFamily={F} fontWeight="700">{label}</text>
+      <text x={cx} y={cy+12} textAnchor="middle" fill={C.muted} fontSize={8.5} fontFamily={F}>{sub}</text>
+    </svg>
+  );
+}
+
+function MiniBar({ label, pct: p, color, val }) {
+  const a=useAnim(p);
+  return (
+    <div style={{marginBottom:8}}>
+      <div style={{display:"flex",justifyContent:"space-between",fontSize:10,marginBottom:3}}>
+        <span style={{color:C.muted}}>{label}</span><span style={{color,fontWeight:600}}>{val}</span>
+      </div>
+      <div style={{height:4,background:C.dim,borderRadius:2}}>
+        <div style={{height:"100%",width:`${clamp(Math.abs(a)*100,0,100)}%`,background:`linear-gradient(90deg,${color}55,${color})`,borderRadius:2,transition:"width .4s ease"}}/>
+      </div>
+    </div>
+  );
+}
+
+function Stat({ label, value, color=C.text }) {
+  return (
+    <div style={{background:C.bg,borderRadius:7,padding:"8px 12px",border:`1px solid ${C.border}`}}>
+      <div style={{fontSize:8,color:C.muted,letterSpacing:".1em",marginBottom:3}}>{label}</div>
+      <div style={{fontSize:14,color,fontWeight:700,fontFamily:F}}>{value}</div>
+    </div>
+  );
+}
+
+function Tag({ text, color, size=9 }) {
+  return <span style={{fontSize:size,background:`${color}18`,border:`1px solid ${color}44`,borderRadius:4,padding:"2px 7px",color,whiteSpace:"nowrap"}}>{text}</span>;
+}
+
+function Slider({ label, icon, min, max, step, value, onChange, display, tooltip }) {
+  return (
+    <div style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:9,padding:"12px 14px",transition:"border-color .2s"}}
+      onMouseEnter={e=>e.currentTarget.style.borderColor=C.blue+"44"}
+      onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
+      <div style={{display:"flex",justifyContent:"space-between",marginBottom:7,alignItems:"center"}}>
+        <span style={{fontSize:9,color:C.muted,letterSpacing:".07em",display:"flex",alignItems:"center"}}>
+          {icon} {label.toUpperCase()}{tooltip&&<Info text={tooltip}/>}
+        </span>
+        <span style={{fontSize:12,fontWeight:700,color:C.white,fontFamily:F}}>{display(value)}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e=>onChange(parseFloat(e.target.value))}
+        style={{width:"100%",accentColor:C.cyan,cursor:"pointer"}}/>
+      <div style={{display:"flex",justifyContent:"space-between",marginTop:2}}>
+        <span style={{fontSize:8,color:C.dim}}>{display(min)}</span>
+        <span style={{fontSize:8,color:C.dim}}>{display(max)}</span>
+      </div>
+    </div>
+  );
+}
+
+function SHdr({ title, sub, tooltip }) {
+  return (
+    <div style={{borderBottom:`1px solid ${C.border}`,paddingBottom:10,marginBottom:18}}>
+      <div style={{fontSize:9,color:C.muted,letterSpacing:".15em",display:"flex",alignItems:"center"}}>
+        {title}{tooltip&&<Info text={tooltip}/>}
+      </div>
+      {sub&&<div style={{fontSize:10,color:C.muted,opacity:.6,marginTop:2}}>{sub}</div>}
+    </div>
+  );
+}
+
+function SecTitle({ icon, title, sub, color=C.cyan }) {
+  return (
+    <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:20,paddingBottom:12,borderBottom:`1px solid ${C.border}`}}>
+      <div style={{width:32,height:32,background:`${color}18`,border:`1px solid ${color}33`,borderRadius:8,display:"flex",alignItems:"center",justifyContent:"center",fontSize:16}}>{icon}</div>
+      <div>
+        <div style={{fontSize:13,fontWeight:700,color:C.white,letterSpacing:".04em"}}>{title}</div>
+        {sub&&<div style={{fontSize:9,color:C.muted,marginTop:1}}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+function Card({ title, children, span=1, color, tooltip }) {
+  return (
+    <div style={{background:C.panel,border:`1px solid ${color?color+"33":C.border}`,borderRadius:12,padding:"18px",gridColumn:`span ${span}`}}>
+      <div style={{fontSize:9,color:C.muted,letterSpacing:".12em",marginBottom:14,display:"flex",alignItems:"center"}}>
+        {title}{tooltip&&<Info text={tooltip}/>}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function HelpBox({ show, items }) {
+  if(!show) return null;
+  return (
+    <div style={{background:`${C.yellow}08`,border:`1px solid ${C.yellow}33`,borderRadius:12,padding:"18px",marginBottom:20}}>
+      <div style={{fontSize:12,fontWeight:700,color:C.yellow,marginBottom:12}}>📖 Plain-Language Guide</div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(230px,1fr))",gap:10}}>
+        {items.map(({t,d})=>(
+          <div key={t} style={{background:C.panel,borderRadius:8,padding:"12px"}}>
+            <div style={{fontSize:10,fontWeight:700,color:C.yellow,marginBottom:4}}>{t}</div>
+            <div style={{fontSize:10,color:C.muted,lineHeight:1.65}}>{d}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function HelpBtn({ show, toggle }) {
+  return (
+    <button onClick={toggle} style={{background:show?C.yellow+"22":C.panel,border:`1px solid ${show?C.yellow+"55":C.border}`,borderRadius:7,padding:"6px 14px",color:show?C.yellow:C.muted,fontFamily:F,fontSize:10,cursor:"pointer"}}>
+      {show?"✕ Hide Guide":"❓ Plain-Language Guide"}
+    </button>
+  );
+}
+
+// ── DATA HELPERS ───────────────────────────────────────────────
+function parseCSV(text) {
+  const lines=text.trim().split("\n");
+  const headers=lines[0].split(",").map(h=>h.trim().replace(/"/g,""));
+  return lines.slice(1).filter(l=>l.trim()).map(line=>{
+    const vals=line.split(",").map(v=>v.trim().replace(/"/g,""));
+    const obj={}; headers.forEach((h,i)=>obj[h]=vals[i]||""); return obj;
+  });
+}
+
+// ── UNIVERSAL FILE DROP ────────────────────────────────────────
+function DropZone({ onData }) {
+  const [drag,setDrag]=useState(false);
+  const [status,setStatus]=useState("idle");
+  const [fileName,setFileName]=useState("");
+  const [rowCount,setRowCount]=useState(0);
+  const [preview,setPreview]=useState(null);
+  const ref=useRef();
+
+  const processFile = file => {
+    setStatus("loading"); setFileName(file.name);
+    const ext=file.name.split(".").pop().toLowerCase();
+    if(["png","jpg","jpeg","gif","webp"].includes(ext)){
+      setPreview(URL.createObjectURL(file)); setStatus("done-image"); return;
+    }
+    if(ext==="pdf"){ setStatus("done-pdf"); return; }
+    const reader=new FileReader();
+    reader.onload=e=>{
+      try{
+        let data;
+        if(ext==="json"){ data=JSON.parse(e.target.result); if(!Array.isArray(data))data=[data]; }
+        else { data=parseCSV(e.target.result); }
+        setRowCount(data.length); setStatus("done-data"); onData(data);
+      }catch{ setStatus("error"); }
+    };
+    reader.readAsText(file);
+  };
+
+  const loadDemo=()=>{
+    const demo=[
+      {companyName:"Alpha Fintech",sector:"Digital Lending",stage:"Series B",teamSize:"280",revenue:"120000000",ebitdaMarginPct:"14",totalDebt:"132000000",equity:"96000000",cash:"18000000",currentRatio:"1.8",marketPosition:"0.6",nps:"52",cac:"1200",ltv:"8400",hq:"Bengaluru",founders:"A. Kumar, B. Singh",operations:"Pan-India"},
+      {companyName:"Beta BNPL",sector:"BNPL",stage:"Series C",teamSize:"520",revenue:"280000000",ebitdaMarginPct:"18",totalDebt:"350000000",equity:"210000000",cash:"42000000",currentRatio:"2.1",marketPosition:"0.72",nps:"61",cac:"800",ltv:"12000",hq:"Mumbai",founders:"C. Mehta",operations:"Pan-India"},
+      {companyName:"Gamma Pay",sector:"Payments",stage:"Series A",teamSize:"180",revenue:"85000000",ebitdaMarginPct:"9",totalDebt:"95000000",equity:"62000000",cash:"8000000",currentRatio:"1.4",marketPosition:"0.41",nps:"44",cac:"1800",ltv:"6200",hq:"Delhi",founders:"D. Joshi",operations:"Tier 1&2"},
+    ];
+    setRowCount(demo.length); setStatus("done-data"); setFileName("demo_dataset.csv"); onData(demo);
+  };
+
+  return (
+    <div style={{marginBottom:24}}>
+      <div onClick={()=>ref.current.click()}
+        onDragOver={e=>{e.preventDefault();setDrag(true)}}
+        onDragLeave={()=>setDrag(false)}
+        onDrop={e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files[0];if(f)processFile(f);}}
+        style={{border:`2px dashed ${drag?C.cyan:status.startsWith("done")?C.green:C.border2}`,borderRadius:14,padding:"32px 24px",textAlign:"center",background:drag?`${C.cyan}08`:status.startsWith("done")?`${C.green}06`:C.panel,cursor:"pointer",transition:"all .2s"}}>
+        <input ref={ref} type="file" accept=".csv,.json,.pdf,.png,.jpg,.jpeg,.gif,.webp" onChange={e=>{if(e.target.files[0])processFile(e.target.files[0]);}} style={{display:"none"}}/>
+        {status==="idle"&&<>
+          <div style={{fontSize:36,marginBottom:12}}>📂</div>
+          <div style={{fontSize:13,color:C.white,fontWeight:600,marginBottom:6}}>Drop any file here to upload</div>
+          <div style={{fontSize:10,color:C.muted,marginBottom:16}}>CSV · JSON · PDF · Images (PNG, JPG)</div>
+          <div style={{display:"flex",gap:8,justifyContent:"center",flexWrap:"wrap"}}>
+            {[".csv",".json",".pdf",".png",".jpg"].map(t=><span key={t} style={{fontSize:9,background:C.dim,borderRadius:4,padding:"3px 8px",color:C.muted,fontFamily:F}}>{t}</span>)}
+          </div>
+        </>}
+        {status==="loading"&&<div style={{fontSize:13,color:C.cyan}}>⏳ Processing {fileName}…</div>}
+        {status==="done-data"&&<><div style={{fontSize:28,marginBottom:8}}>✅</div><div style={{fontSize:13,color:C.green,fontWeight:600}}>{fileName}</div><div style={{fontSize:10,color:C.muted,marginTop:4}}>{rowCount} records loaded</div></>}
+        {status==="done-pdf"&&<><div style={{fontSize:28,marginBottom:8}}>📄</div><div style={{fontSize:13,color:C.green,fontWeight:600}}>{fileName} — PDF uploaded</div></>}
+        {status==="done-image"&&<><img src={preview} alt="preview" style={{maxHeight:120,maxWidth:"100%",borderRadius:8,marginBottom:8,objectFit:"contain"}}/><div style={{fontSize:13,color:C.green,fontWeight:600}}>{fileName}</div></>}
+        {status==="error"&&<div style={{fontSize:13,color:C.red}}>⚠ Could not parse file — check format</div>}
+      </div>
+      <div style={{display:"flex",gap:10,marginTop:10,alignItems:"center"}}>
+        <button onClick={loadDemo} style={{background:C.blue+"22",border:`1px solid ${C.blue}44`,borderRadius:7,padding:"7px 16px",color:C.blue,fontFamily:F,fontSize:10,cursor:"pointer",fontWeight:600}}>⚡ Load Demo Dataset (3 entities)</button>
+        <span style={{fontSize:9,color:C.muted}}>or drop your own CSV/JSON above</span>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// MODULE 1: CREDIT RISK
+// ══════════════════════════════════════════════════════════════
+const CR_DEF={creditScore:680,monthlySalary:45000,dti:35,utilizationRate:38,monthsEmployed:24,numDelinquencies:1,loanToIncome:4.0,age:28,loanAmount:50000,loanTenureMonths:12,salaryRegularity:80,niraRepaymentScore:60,gig:0,topUpEligible:1,creditLimit:150000,bnplOrderValue:8000,bnplTenure:3,bnplPrevOrders:5,bnplMissed:0};
+
+function computeCR(i, lender) {
+  let pd,lgd,ead,eadMeta={};
+  if(lender==="personal"){
+    const z=2.8-.038*i.creditScore+.045*i.dti+.028*i.utilizationRate-.030*i.salaryRegularity-.010*i.monthsEmployed+.070*i.numDelinquencies+.035*i.loanToIncome-.008*i.niraRepaymentScore+.018*(i.gig||0)-.000002*i.monthlySalary+.012*i.loanTenureMonths/12-.005*i.age;
+    pd=clamp(logistic(z),.01,.97);
+    lgd=clamp(.72-.0004*(i.creditScore-650)+.03*i.numDelinquencies-.0015*i.salaryRegularity-.0018*i.niraRepaymentScore+.055*(i.gig||0)+.004*(i.loanTenureMonths-6)-.0000012*(i.monthlySalary-40000)+.005*i.dti,.12,.97);
+    const def_t=clamp(.30+.02*i.numDelinquencies-.01*i.niraRepaymentScore/20,.05,.80);
+    const out=i.loanAmount*(1-def_t*.5), topUp=i.topUpEligible?.12*i.loanAmount*(i.dti/50):0;
+    ead=clamp(out+topUp,0,i.loanAmount*1.05); eadMeta={outstanding:out,topUp};
+  }else if(lender==="card"){
+    const z=3.2-.045*i.creditScore+.038*i.dti+.032*i.utilizationRate-.028*(i.salaryRegularity||85)-.012*i.monthsEmployed+.085*i.numDelinquencies-.008*i.age+.041*i.loanToIncome-.000003*i.monthlySalary;
+    pd=clamp(logistic(z),.01,.97);
+    lgd=clamp(.65-.00035*(i.creditScore-650)+.025*i.numDelinquencies-.0006*i.monthsEmployed+.0018*i.utilizationRate+.004*i.dti,.10,.98);
+    const out=i.utilizationRate/100*i.creditLimit, undrawn=(1-i.utilizationRate/100)*i.creditLimit;
+    const ccf=clamp(.55-.004*i.utilizationRate-.003*(i.salaryRegularity||85)+.04*i.numDelinquencies+.006*i.dti,.05,.95);
+    ead=clamp(out+ccf*undrawn,0,i.creditLimit); eadMeta={outstanding:out,ccf};
+  }else{
+    const z=1.8-.025*i.creditScore+.055*i.dti-.08*i.bnplPrevOrders+.15*i.bnplMissed+.020*(i.bnplOrderValue/1000)+.040*i.utilizationRate/10;
+    pd=clamp(logistic(z),.01,.95);
+    lgd=clamp(.55-.0003*(i.creditScore-650)+.04*i.bnplMissed+.003*i.dti,.15,.90);
+    ead=clamp(i.bnplOrderValue*(1+.05*i.bnplMissed),0,i.bnplOrderValue*1.1); eadMeta={orderValue:i.bnplOrderValue};
+  }
+  return {pd,lgd,ead,ecl:pd*lgd*ead,eadMeta};
+}
+
+function CreditRiskModule() {
+  const [inp,setInp]=useState(CR_DEF);
+  const [lender,setLender]=useState("personal");
+  const [tab,setTab]=useState("overview");
+  const [help,setHelp]=useState(false);
+  const set=(k,v)=>setInp(p=>({...p,[k]:v}));
+  const {pd,lgd,ead,ecl,eadMeta}=computeCR(inp,lender);
+  const lim=lender==="personal"?inp.loanAmount:lender==="card"?inp.creditLimit:inp.bnplOrderValue;
+  const eclRatio=ecl/lim;
+  const pdB=pdBand(pd),lgdB=lgdBand(lgd),eclB=eclBand(eclRatio);
+  const aECL=useAnim(ecl),aPD=useAnim(pd*100),aLGD=useAnim(lgd*100),aEAD=useAnim(ead);
+  const dec=pd<.12?{l:"APPROVE",c:C.green}:pd<.28?{l:"REVIEW",c:C.yellow}:{l:"DECLINE",c:C.red};
+  const LENDERS=[{k:"personal",l:"Personal Loan",s:"Salary-based"},{k:"card",l:"Credit Card",s:"Revolving"},{k:"bnpl",l:"BNPL",s:"Pay-later"}];
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div style={{display:"flex",gap:6,flexWrap:"wrap"}}>
+          {LENDERS.map(l=>(
+            <button key={l.k} onClick={()=>setLender(l.k)} style={{padding:"8px 16px",border:"none",borderRadius:7,cursor:"pointer",background:lender===l.k?C.blue+"22":C.panel,color:lender===l.k?C.blue:C.muted,fontFamily:F,fontSize:11,fontWeight:lender===l.k?700:400,borderBottom:`2px solid ${lender===l.k?C.blue:"transparent"}`,transition:"all .2s"}}>
+              {l.l} <span style={{fontSize:9,opacity:.7}}>· {l.s}</span>
+            </button>
+          ))}
+        </div>
+        <HelpBtn show={help} toggle={()=>setHelp(h=>!h)}/>
+      </div>
+
+      <HelpBox show={help} items={[
+        {t:"PD – Probability of Default",d:"How likely the borrower stops repaying. 5% = 5 in 100 will default. Below 5% = AAA grade."},
+        {t:"LGD – Loss Given Default",d:"If they default, how much is unrecovered. 60% = ₹60K lost on a ₹1L loan."},
+        {t:"EAD – Exposure at Default",d:"Total amount owed at moment of default — principal + top-ups or undrawn credit."},
+        {t:"ECL – Expected Credit Loss",d:"PD × LGD × EAD. This is the provision amount required under IFRS 9 accounting."},
+        {t:"CIBIL Score",d:"India's credit score 300–900. Above 750 = excellent. Below 600 = high risk."},
+        {t:"DTI %",d:"% of monthly income going to all debt repayments. Below 30% = healthy. Above 50% = danger."},
+        {t:"Utilization %",d:"How much of credit card limit is used. Below 30% = ideal. Above 80% = red flag."},
+        {t:"IFRS 9 Stage",d:"Stage 1 = healthy. Stage 2 = increased risk. Stage 3 = credit-impaired."},
+      ]}/>
+
+      {/* KPI strip */}
+      <div style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:8,marginBottom:18}}>
+        {[{l:"PD",v:`${aPD.toFixed(1)}%`,c:pdB.color,s:pdB.label},{l:"LGD",v:`${aLGD.toFixed(1)}%`,c:lgdB.color,s:lgdB.label},{l:"EAD",v:`₹${fmt(aEAD,0)}`,c:C.blue,s:"Exposure"},{l:"ECL",v:`₹${fmt(aECL,0)}`,c:eclB.color,s:eclB.label},{l:"DECISION",v:dec.l,c:dec.c,s:"Underwrite"}].map(m=>(
+          <div key={m.l} style={{background:C.panel,border:`1px solid ${m.c}22`,borderRadius:9,padding:"12px 14px",borderTop:`2px solid ${m.c}`}}>
+            <div style={{fontSize:8,color:C.muted,letterSpacing:".12em"}}>{m.l}</div>
+            <div style={{fontSize:16,fontWeight:700,color:m.c,fontFamily:F,marginTop:4}}>{m.v}</div>
+            <div style={{fontSize:9,color:C.muted,marginTop:2}}>{m.s}</div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{display:"flex",gap:3,marginBottom:18,borderBottom:`1px solid ${C.border}`}}>
+        {["overview","factors","scenarios","inputs"].map(t=>(
+          <button key={t} onClick={()=>setTab(t)} style={{padding:"6px 16px",border:"none",background:"transparent",cursor:"pointer",color:tab===t?C.cyan:C.muted,fontFamily:F,fontSize:10,letterSpacing:".08em",textTransform:"uppercase",borderBottom:`2px solid ${tab===t?C.cyan:"transparent"}`,transition:"all .2s"}}>{t}</button>
+        ))}
+      </div>
+
+      {tab==="overview"&&(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:14}}>
+          {[
+            {title:"PROBABILITY OF DEFAULT",val:pd,color:pdB.color,label:`${(pd*100).toFixed(1)}%`,sub:"PD",band:pdB.label,items:[{l:"Model",v:"Logistic Regression"},{l:"Standard",v:"Basel II"},{l:"Horizon",v:"12-month"}]},
+            {title:"LOSS GIVEN DEFAULT",val:lgd,color:lgdB.color,label:`${(lgd*100).toFixed(1)}%`,sub:"LGD",band:lgdB.label,items:[{l:"Recovery",v:`${((1-lgd)*100).toFixed(1)}%`},{l:"Collateral",v:"None"},{l:"Seniority",v:"Unsecured"}]},
+            {title:"EXPOSURE AT DEFAULT",val:ead/lim,color:C.blue,label:`₹${fmt(ead,0)}`,sub:"EAD",band:`${((ead/lim)*100).toFixed(0)}% of limit`,items:[{l:"Model",v:lender==="card"?"CCF-based":"Amortization"},{l:"Outstanding",v:`₹${fmt(eadMeta.outstanding||ead,0)}`},{l:"Add-on",v:`₹${fmt(eadMeta.topUp||eadMeta.ccf&&ead*eadMeta.ccf||0,0)}`}]},
+          ].map(card=>(
+            <div key={card.title} style={{background:C.panel,border:`1px solid ${card.color}22`,borderRadius:12,padding:"18px"}}>
+              <div style={{fontSize:8,color:C.muted,letterSpacing:".12em",marginBottom:14}}>{card.title}</div>
+              <div style={{display:"flex",alignItems:"center",gap:14,marginBottom:14}}>
+                <Arc value={card.val} color={card.color} size={90} label={card.label} sub={card.sub}/>
+                <div>
+                  <div style={{fontSize:18,fontWeight:700,color:card.color,fontFamily:F}}>{card.band}</div>
+                  {card.items.map(it=><div key={it.l} style={{fontSize:9,color:C.muted,marginTop:4}}>{it.l}: <span style={{color:C.text}}>{it.v}</span></div>)}
+                </div>
+              </div>
+            </div>
+          ))}
+          <div style={{gridColumn:"span 3",background:C.panel,border:`1px solid ${eclB.color}33`,borderRadius:12,padding:"18px",display:"flex",gap:28,alignItems:"center",flexWrap:"wrap"}}>
+            <div>
+              <div style={{fontSize:8,color:C.muted,letterSpacing:".12em",marginBottom:4}}>ECL = PD × LGD × EAD</div>
+              <div style={{fontSize:34,fontWeight:700,color:eclB.color,fontFamily:F}}>₹{fmt(ecl,0)}</div>
+              <div style={{fontSize:10,color:eclB.color,opacity:.8}}>{eclB.label} · {pct(eclRatio)} of limit</div>
+            </div>
+            <div style={{flex:1,minWidth:240}}>
+              <MiniBar label="PD" pct={pd} color={pdB.color} val={pct(pd)}/>
+              <MiniBar label="LGD" pct={lgd} color={lgdB.color} val={pct(lgd)}/>
+              <MiniBar label="EAD / Limit" pct={ead/lim} color={C.blue} val={`₹${fmt(ead,0)}`}/>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+              {[{l:"IFRS 9 Stage",v:pd<.05?"Stage 1":pd<.20?"Stage 2":"Stage 3",c:pd<.05?C.green:pd<.20?C.yellow:C.red},{l:"Lifetime ECL",v:`₹${fmt(ecl,0)}`,c:eclB.color},{l:"12-mo ECL",v:`₹${fmt(ecl*Math.min(1,12/(lender==="personal"?inp.loanTenureMonths:12)),0)}`,c:C.muted}].map(m=><Stat key={m.l} label={m.l} value={m.v} color={m.c}/>)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab==="factors"&&(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+          <Card title="PD FACTOR CONTRIBUTIONS" tooltip="Each factor's weight in the PD model. Positive = increases default risk.">
+            {[
+              {l:"Credit Score (protective)",v:-.038*(inp.creditScore-650)/10,c:C.green},
+              {l:"DTI Ratio",v:.045*inp.dti/10,c:inp.dti>40?C.red:C.muted},
+              {l:"Card Utilization",v:.028*inp.utilizationRate/10,c:inp.utilizationRate>60?C.orange:C.muted},
+              {l:"Delinquencies",v:.070*inp.numDelinquencies,c:inp.numDelinquencies>2?C.red:C.yellow},
+              {l:"Loan-to-Income",v:.035*inp.loanToIncome,c:inp.loanToIncome>6?C.orange:C.muted},
+              {l:"Employment (protective)",v:-.010*inp.monthsEmployed/10,c:C.green},
+            ].map((d,i)=><MiniBar key={i} label={d.l} pct={Math.abs(d.v)/1.5} color={d.c} val={`${d.v>=0?"+":""}${d.v.toFixed(3)}`}/>)}
+          </Card>
+          <Card title="STRESS SCENARIOS — ECL IMPACT" tooltip="ECL under different economic scenarios. Basel requires adverse + severely adverse testing.">
+            {[{s:"Optimistic",pdM:.6,lgdM:.85,c:C.green},{s:"Base Case",pdM:1,lgdM:1,c:C.blue},{s:"Adverse",pdM:1.6,lgdM:1.1,c:C.yellow},{s:"Severely Adverse",pdM:2.8,lgdM:1.2,c:C.orange},{s:"Tail Risk",pdM:5.0,lgdM:1.3,c:C.red}].map(sc=>{
+              const spd=clamp(pd*sc.pdM,0,.99),slgd=clamp(lgd*sc.lgdM,0,.98),secl=spd*slgd*ead;
+              return (
+                <div key={sc.s} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 13px",background:C.bg,borderRadius:8,marginBottom:7,border:`1px solid ${sc.s==="Base Case"?C.blue+"33":C.border}`}}>
+                  <div><div style={{fontSize:11,color:sc.c,fontWeight:600}}>{sc.s}</div><div style={{fontSize:9,color:C.muted}}>PD×{sc.pdM} · LGD×{sc.lgdM}</div></div>
+                  <div style={{textAlign:"right"}}><div style={{fontSize:14,color:sc.c,fontWeight:700,fontFamily:F}}>₹{fmt(secl,0)}</div><div style={{fontSize:9,color:C.muted}}>{pct(spd)} × {pct(slgd)}</div></div>
+                </div>
+              );
+            })}
+          </Card>
+        </div>
+      )}
+
+      {tab==="scenarios"&&(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+          <Card title="BORROWER ARCHETYPES — click to load">
+            {[{l:"Prime Salaried",icon:"🏆",v:{...CR_DEF,creditScore:780,dti:22,utilizationRate:25,monthsEmployed:60,numDelinquencies:0}},{l:"Standard Borrower",icon:"👤",v:CR_DEF},{l:"Near-Prime",icon:"⚡",v:{...CR_DEF,creditScore:620,dti:48,utilizationRate:65,numDelinquencies:2}},{l:"High Risk",icon:"⚠️",v:{...CR_DEF,creditScore:540,dti:65,utilizationRate:88,numDelinquencies:4,gig:1}}].map(s=>{
+              const r=computeCR(s.v,lender),pb=pdBand(r.pd);
+              return (
+                <div key={s.l} onClick={()=>setInp(s.v)} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"9px 13px",borderRadius:8,marginBottom:6,cursor:"pointer",background:C.bg,border:`1px solid ${C.border}`,transition:"all .2s"}}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor=pb.color+"55"} onMouseLeave={e=>e.currentTarget.style.borderColor=C.border}>
+                  <span style={{fontSize:11,color:C.text}}>{s.icon} {s.l}</span>
+                  <div style={{display:"flex",gap:10,alignItems:"center"}}><span style={{fontSize:10,color:C.muted}}>{pct(r.pd)}</span><span style={{fontSize:12,color:pb.color,fontWeight:700,fontFamily:F}}>{pb.label}</span></div>
+                </div>
+              );
+            })}
+          </Card>
+          <Card title="CREDIT SCORE vs PD SENSITIVITY">
+            {[300,450,550,620,680,720,780,850].map(cs=>{
+              const r=computeCR({...inp,creditScore:cs},lender),pb=pdBand(r.pd);
+              const isA=Math.abs(cs-inp.creditScore)<30;
+              return (
+                <div key={cs} style={{display:"flex",alignItems:"center",gap:10,marginBottom:7,padding:"5px 10px",borderRadius:7,background:isA?`${C.cyan}12`:C.bg,border:`1px solid ${isA?C.cyan+"33":C.border}`}}>
+                  <span style={{fontSize:10,color:isA?C.cyan:C.muted,minWidth:38,fontFamily:F}}>{cs}</span>
+                  <div style={{flex:1,height:4,background:C.dim,borderRadius:2}}><div style={{height:"100%",width:`${clamp(r.pd*200,0,100)}%`,background:`linear-gradient(90deg,${C.green},${C.red})`,borderRadius:2}}/></div>
+                  <span style={{fontSize:11,color:isA?C.cyan:pb.color,fontFamily:F,minWidth:44,textAlign:"right"}}>{pct(r.pd,1)}</span>
+                  <span style={{fontSize:9,color:pb.color,minWidth:36}}>{pb.label}</span>
+                </div>
+              );
+            })}
+          </Card>
+        </div>
+      )}
+
+      {tab==="inputs"&&(
+        <div>
+          <div style={{background:`${C.blue}08`,border:`1px solid ${C.blue}22`,borderRadius:10,padding:"12px 16px",marginBottom:16,fontSize:10,color:C.muted,lineHeight:1.7}}>
+            💡 <strong style={{color:C.blue}}>How to use:</strong> Adjust the sliders to match a borrower's profile. All risk metrics update instantly. Hover any <span style={{color:C.yellow}}>?</span> for plain-language explanations.
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(260px,1fr))",gap:10}}>
+            {[
+              {k:"creditScore",l:"Credit Score (CIBIL)",icon:"📊",min:300,max:900,step:1,d:v=>`${v}`,t:"India's credit score 300–900. Above 750 = excellent. Below 600 = high risk."},
+              {k:"monthlySalary",l:"Monthly Salary",icon:"💰",min:10000,max:300000,step:1000,d:v=>`₹${fmt(v)}`,t:"Gross monthly salary. Higher = better repayment capacity."},
+              {k:"dti",l:"Debt-to-Income %",icon:"⚖️",min:0,max:80,step:1,d:v=>`${v}%`,t:"% of monthly income going to all debts. Below 30% = healthy. Above 50% = risky."},
+              {k:"utilizationRate",l:"Credit Card Utilization %",icon:"💳",min:0,max:100,step:1,d:v=>`${v}%`,t:"How much of credit card limits is used. Below 30% = ideal. Above 80% = red flag."},
+              {k:"monthsEmployed",l:"Employment Duration",icon:"🏢",min:0,max:240,step:1,d:v=>`${v}mo`,t:"Months at current employer. Longer = more stable. Below 6 months = high risk."},
+              {k:"numDelinquencies",l:"Past Delinquencies",icon:"⚠️",min:0,max:10,step:1,d:v=>`${v}`,t:"Times this borrower missed past payments. Even 1 significantly increases PD."},
+              {k:"loanToIncome",l:"Loan-to-Income Ratio",icon:"📐",min:0,max:20,step:.1,d:v=>`${v.toFixed(1)}x`,t:"Loan amount ÷ annual income. 4x = ₹4 borrowed per ₹1 of yearly income."},
+              {k:"age",l:"Borrower Age",icon:"👤",min:18,max:65,step:1,d:v=>`${v}yr`,t:"Age of the borrower. Young (18–22) or near-retirement slightly raises risk."},
+              ...(lender==="personal"?[
+                {k:"loanAmount",l:"Loan Amount",icon:"🏦",min:5000,max:200000,step:1000,d:v=>`₹${fmt(v)}`,t:"Total loan principal being requested."},
+                {k:"loanTenureMonths",l:"Loan Tenure",icon:"📅",min:1,max:36,step:1,d:v=>`${v}mo`,t:"Months to repay. Longer = smaller EMI but more total interest."},
+                {k:"salaryRegularity",l:"Salary Regularity %",icon:"🔄",min:0,max:100,step:1,d:v=>`${v}%`,t:"How consistently salary arrives on time. Gig workers score lower."},
+                {k:"niraRepaymentScore",l:"Internal Repayment Score",icon:"⭐",min:0,max:100,step:1,d:v=>`${v}/100`,t:"Platform's own score based on past repayments. Higher = better track record."},
+              ]:[]),
+              ...(lender==="card"?[{k:"creditLimit",l:"Credit Card Limit",icon:"💳",min:10000,max:1000000,step:5000,d:v=>`₹${fmt(v)}`,t:"Total sanctioned credit card limit."}]:[]),
+              ...(lender==="bnpl"?[
+                {k:"bnplOrderValue",l:"Order Value",icon:"🛍️",min:500,max:100000,step:500,d:v=>`₹${fmt(v)}`,t:"Value of the BNPL purchase — becomes the EAD."},
+                {k:"bnplTenure",l:"Repayment Months",icon:"📅",min:1,max:12,step:1,d:v=>`${v}mo`,t:"Months to repay. Longer = higher default risk."},
+                {k:"bnplPrevOrders",l:"Previous BNPL Orders",icon:"📦",min:0,max:50,step:1,d:v=>`${v}`,t:"Past BNPL orders. More history = more data. Also indicates habit."},
+                {k:"bnplMissed",l:"Missed Payments",icon:"⚠️",min:0,max:10,step:1,d:v=>`${v}`,t:"Past missed BNPL payments. Even 1 significantly raises PD."},
+              ]:[]),
+            ].map(f=><Slider key={f.k} label={f.l} icon={f.icon} min={f.min} max={f.max} step={f.step} value={inp[f.k]} onChange={v=>set(f.k,v)} display={f.d} tooltip={f.t}/>)}
+            {lender==="personal"&&<div style={{background:C.bg,border:`1px solid ${inp.gig?C.orange+"55":C.border}`,borderRadius:9,padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}} onClick={()=>set("gig",inp.gig?0:1)}>
+              <span style={{fontSize:10,color:C.muted}}>🛵 GIG WORKER<Info text="Gig/freelance workers have more variable income and higher default risk than salaried employees."/></span>
+              <span style={{fontSize:13,color:inp.gig?C.orange:C.muted,fontWeight:700}}>{inp.gig?"ON":"OFF"}</span>
+            </div>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// MODULE 2: FRAUD DETECTION
+// ══════════════════════════════════════════════════════════════
+const FR_DEF={txnAmount:12000,txnHour:14,dayOfWeek:2,merchantCategory:0,velocity24h:3,velocity7d:12,avgTxnAmount:9000,distanceFromHome:5,newDevice:0,newLocation:0,failedAttempts:0,cardPresentFlag:1,intlTxn:0,creditScore:680,accountAgeDays:420,unusualMerchant:0};
+const FR_CAT=["Grocery","Electronics","Travel","Fuel","Entertainment","Online","ATM","Jewellery"];
+
+function computeFraud(i) {
+  const z=-4.0+0.00008*Math.max(0,i.txnAmount-i.avgTxnAmount)+0.30*(i.txnHour<6||i.txnHour>22?1:0)+0.20*(i.dayOfWeek>=5?1:0)+0.40*i.newDevice+0.35*i.newLocation+0.50*i.unusualMerchant+0.20*i.intlTxn+0.18*Math.max(0,i.velocity24h-5)+0.08*Math.max(0,i.velocity7d-20)+0.45*Math.max(0,i.failedAttempts)-0.002*i.accountAgeDays-0.003*i.creditScore/100+0.35*(1-i.cardPresentFlag)+0.50*(i.merchantCategory===7?1:0);
+  const rawProb=logistic(z),score=Math.round(clamp(rawProb*100,0,99));
+  const flags=[];
+  if(i.txnAmount>i.avgTxnAmount*2.5)flags.push({label:"AMOUNT SPIKE",color:C.red,severity:"HIGH"});
+  if(i.txnHour<6||i.txnHour>22)flags.push({label:"ODD HOURS",color:C.orange,severity:"MED"});
+  if(i.newDevice)flags.push({label:"NEW DEVICE",color:C.orange,severity:"MED"});
+  if(i.newLocation)flags.push({label:"NEW LOCATION",color:C.orange,severity:"MED"});
+  if(i.velocity24h>8)flags.push({label:"HIGH VELOCITY",color:C.red,severity:"HIGH"});
+  if(i.failedAttempts>1)flags.push({label:"FAILED ATTEMPTS",color:C.red,severity:"HIGH"});
+  if(i.intlTxn)flags.push({label:"INTERNATIONAL",color:C.yellow,severity:"LOW"});
+  if(i.unusualMerchant)flags.push({label:"UNUSUAL MERCHANT",color:C.red,severity:"HIGH"});
+  if(!i.cardPresentFlag)flags.push({label:"CARD NOT PRESENT",color:C.yellow,severity:"LOW"});
+  const action=score<20?{l:"ALLOW",c:C.green}:score<40?{l:"MONITOR",c:C.cyan}:score<60?{l:"SOFT BLOCK",c:C.yellow}:score<80?{l:"CHALLENGE",c:C.orange}:{l:"BLOCK",c:C.red};
+  return {score,rawProb,flags,action};
+}
+
+function FraudModule() {
+  const [inp,setInp]=useState(FR_DEF);
+  const [tab,setTab]=useState("realtime");
+  const [help,setHelp]=useState(false);
+  const set=(k,v)=>setInp(p=>({...p,[k]:v}));
+  const {score,rawProb,flags,action}=computeFraud(inp);
+  const fb=fraudBand(score);
+  const aScore=useAnim(score);
+  const [feed]=useState(()=>Array.from({length:12},(_,i)=>{const s=Math.floor(Math.random()*100),b=fraudBand(s);return {id:`TXN${String(i+1).padStart(4,"0")}`,amount:Math.floor(Math.random()*50000+500),merchant:FR_CAT[Math.floor(Math.random()*8)],score:s,color:b.color,time:`${String(Math.floor(Math.random()*23)).padStart(2,"0")}:${String(Math.floor(Math.random()*59)).padStart(2,"0")}`};}));
+
+  return (
+    <div>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16,flexWrap:"wrap",gap:10}}>
+        <div style={{display:"flex",gap:3,borderBottom:`1px solid ${C.border}`}}>
+          {["realtime","scoring","feed"].map(t=><button key={t} onClick={()=>setTab(t)} style={{padding:"6px 16px",border:"none",background:"transparent",cursor:"pointer",color:tab===t?C.cyan:C.muted,fontFamily:F,fontSize:10,letterSpacing:".08em",textTransform:"uppercase",borderBottom:`2px solid ${tab===t?C.cyan:"transparent"}`,transition:"all .2s"}}>{t}</button>)}
+        </div>
+        <HelpBtn show={help} toggle={()=>setHelp(h=>!h)}/>
+      </div>
+
+      <HelpBox show={help} items={[
+        {t:"Fraud Score 0–100",d:"0 = definitely clean, 100 = definitely fraud. Multiple signals are combined to arrive at this number."},
+        {t:"Transaction Velocity",d:"How many transactions in the last 24h or 7 days. Many in a short window is suspicious."},
+        {t:"New Device / Location",d:"Transaction from an unknown device or location raises the score significantly."},
+        {t:"Card Not Present",d:"Online transactions (no physical card swipe) carry more fraud risk."},
+        {t:"Amount Spike",d:"Transaction much larger than the customer's average is a red flag."},
+        {t:"Soft Block vs Hard Block",d:"Soft Block = ask for OTP. Challenge = call customer. Block = hard decline + alert."},
+      ]}/>
+
+      {tab==="realtime"&&(
+        <div style={{display:"grid",gridTemplateColumns:"300px 1fr",gap:16}}>
+          <div style={{background:C.panel,border:`1px solid ${fb.color}33`,borderRadius:12,padding:"20px"}}>
+            <SHdr title="FRAUD SCORE"/>
+            <div style={{textAlign:"center",marginBottom:20}}>
+              <Arc value={score/100} color={fb.color} size={130} label={`${Math.round(aScore)}`} sub="/ 100"/>
+              <div style={{fontSize:20,fontWeight:700,color:fb.color,fontFamily:F,marginTop:8}}>{fb.label}</div>
+              <div style={{marginTop:10,display:"inline-block",background:`${action.c}18`,border:`1px solid ${action.c}44`,borderRadius:7,padding:"5px 16px",fontSize:12,color:action.c,fontWeight:700}}>{action.l}</div>
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+              <Stat label="RAW PROB" value={pct(rawProb)} color={fb.color}/>
+              <Stat label="FLAGS" value={flags.length} color={flags.length>2?C.red:flags.length>0?C.yellow:C.green}/>
+              <Stat label="TXN AMT" value={`₹${fmt(inp.txnAmount)}`}/>
+              <Stat label="AVG AMT" value={`₹${fmt(inp.avgTxnAmount)}`} color={C.muted}/>
+            </div>
+          </div>
+          <div style={{display:"flex",flexDirection:"column",gap:14}}>
+            <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px"}}>
+              <SHdr title="ANOMALY FLAGS" tooltip="Each flag independently raises fraud probability. Multiple flags compound risk."/>
+              {flags.length===0?<div style={{fontSize:11,color:C.green,padding:"12px 0"}}>✓ No anomalies — transaction appears clean</div>:<div style={{display:"flex",flexWrap:"wrap",gap:8}}>{flags.map((f,i)=><div key={i} style={{background:`${f.color}15`,border:`1px solid ${f.color}44`,borderRadius:7,padding:"6px 12px",display:"flex",alignItems:"center",gap:8}}><div style={{width:6,height:6,borderRadius:"50%",background:f.color}}/><span style={{fontSize:10,color:f.color,fontWeight:700}}>{f.label}</span><span style={{fontSize:9,color:C.muted}}>{f.severity}</span></div>)}</div>}
+            </div>
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:10}}>
+              {[
+                {k:"txnAmount",l:"Transaction Amount",icon:"💸",min:100,max:200000,step:100,d:v=>`₹${fmt(v)}`,t:"Value of the transaction being analysed."},
+                {k:"avgTxnAmount",l:"Customer's Avg Transaction",icon:"📊",min:100,max:100000,step:100,d:v=>`₹${fmt(v)}`,t:"Customer's average transaction amount. A spike above this is suspicious."},
+                {k:"txnHour",l:"Transaction Hour (24h)",icon:"🕐",min:0,max:23,step:1,d:v=>`${String(v).padStart(2,"0")}:00`,t:"Transactions between midnight–6am are automatically flagged."},
+                {k:"velocity24h",l:"Transactions in Last 24h",icon:"⚡",min:0,max:30,step:1,d:v=>`${v}`,t:"How many transactions has this card made in the past 24 hours? Above 8 is suspicious."},
+                {k:"velocity7d",l:"Transactions in Last 7 Days",icon:"📈",min:0,max:100,step:1,d:v=>`${v}`,t:"Transaction count over the past week. Sudden spikes are a red flag."},
+                {k:"failedAttempts",l:"Failed Auth Attempts",icon:"❌",min:0,max:10,step:1,d:v=>`${v}`,t:"Failed PIN/OTP attempts. Multiple failures = possible card testing by fraudsters."},
+                {k:"accountAgeDays",l:"Account Age (days)",icon:"📅",min:1,max:3650,step:10,d:v=>`${v}d`,t:"New accounts are higher risk. 1 year+ is considered established."},
+              ].map(f=><Slider key={f.k} label={f.l} icon={f.icon} min={f.min} max={f.max} step={f.step} value={inp[f.k]} onChange={v=>set(f.k,v)} display={f.d} tooltip={f.t}/>)}
+              {[
+                {k:"newDevice",l:"New Device",icon:"📱",t:"Transaction from a device not previously seen for this account."},
+                {k:"newLocation",l:"New Location",icon:"🗺️",t:"Transaction from a country/city not seen before for this customer."},
+                {k:"intlTxn",l:"International Transaction",icon:"🌍",t:"Cross-border transaction carries higher fraud risk."},
+                {k:"cardPresentFlag",l:"Card Present (Physical Swipe)",icon:"💳",t:"Physical card swiped = lower risk. Online = higher risk."},
+                {k:"unusualMerchant",l:"Unusual Merchant",icon:"🏪",t:"Merchant category not in customer's history — e.g., suddenly buying jewellery."},
+              ].map(f=><div key={f.k} style={{background:C.bg,border:`1px solid ${inp[f.k]?(f.k==="cardPresentFlag"?C.green:C.orange)+"55":C.border}`,borderRadius:9,padding:"12px 14px",cursor:"pointer",display:"flex",justifyContent:"space-between",alignItems:"center"}} onClick={()=>set(f.k,inp[f.k]?0:1)}>
+                <span style={{fontSize:10,color:C.muted,display:"flex",alignItems:"center"}}>{f.icon} {f.l.toUpperCase()}<Info text={f.t}/></span>
+                <span style={{fontSize:12,color:inp[f.k]?(f.k==="cardPresentFlag"?C.green:C.orange):C.muted,fontWeight:700}}>{inp[f.k]?"ON":"OFF"}</span>
+              </div>)}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {tab==="scoring"&&(
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16}}>
+          <Card title="FEATURE CONTRIBUTIONS" tooltip="Each factor's contribution to the fraud logit score.">
+            {[{l:"Amount vs Avg",v:.00008*Math.max(0,inp.txnAmount-inp.avgTxnAmount),c:inp.txnAmount>inp.avgTxnAmount*2?C.red:C.muted},{l:"Off-Hours",v:.30*(inp.txnHour<6||inp.txnHour>22?1:0),c:C.orange},{l:"New Device",v:.40*inp.newDevice,c:inp.newDevice?C.orange:C.muted},{l:"New Location",v:.35*inp.newLocation,c:inp.newLocation?C.orange:C.muted},{l:"Unusual Merchant",v:.50*inp.unusualMerchant,c:inp.unusualMerchant?C.red:C.muted},{l:"International",v:.20*inp.intlTxn,c:inp.intlTxn?C.yellow:C.muted},{l:"Velocity 24h (excess)",v:.18*Math.max(0,inp.velocity24h-5),c:inp.velocity24h>5?C.red:C.muted},{l:"Failed Attempts",v:.45*inp.failedAttempts,c:inp.failedAttempts>0?C.red:C.muted},{l:"Card Not Present",v:.35*(1-inp.cardPresentFlag),c:!inp.cardPresentFlag?C.yellow:C.muted},{l:"Account Age (protective)",v:-.002*inp.accountAgeDays,c:C.green}].map((d,i)=><MiniBar key={i} label={d.l} pct={Math.abs(d.v)/1.5} color={d.c} val={`${d.v>=0?"+":""}${d.v.toFixed(3)}`}/>)}
+          </Card>
+          <Card title="RISK THRESHOLDS & ACTIONS">
+            {[{range:"0–20",action:"ALLOW",detail:"Auto-approve, standard monitoring",c:C.green},{range:"20–40",action:"MONITOR",detail:"Allow with enhanced logging",c:C.cyan},{range:"40–60",action:"SOFT BLOCK",detail:"Require OTP / 2FA step-up",c:C.yellow},{range:"60–80",action:"CHALLENGE",detail:"Call verification / hold 30 min",c:C.orange},{range:"80–100",action:"BLOCK",detail:"Hard decline, alert customer",c:C.red}].map(t=>{
+              const lo=parseInt(t.range),hi=parseInt(t.range.split("–")[1]),isA=score>=lo&&score<hi;
+              return <div key={t.range} style={{background:isA?`${t.c}12`:C.bg,border:`1px solid ${isA?t.c+"44":C.border}`,borderRadius:8,padding:"11px 14px",marginBottom:8,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                <div><span style={{fontSize:12,color:t.c,fontWeight:700}}>{t.action}</span><span style={{fontSize:9,color:C.muted,marginLeft:8}}>Score {t.range}</span><div style={{fontSize:10,color:C.muted,marginTop:3}}>{t.detail}</div></div>
+                {isA&&<Tag text="ACTIVE" color={t.c}/>}
+              </div>;
+            })}
+          </Card>
+        </div>
+      )}
+
+      {tab==="feed"&&(
+        <Card title="SIMULATED TRANSACTION FEED — Last 12 transactions">
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr",gap:4,marginBottom:10,fontSize:9,color:C.muted,letterSpacing:".1em",padding:"0 8px"}}>
+            <span>TXN ID</span><span>TIME</span><span>MERCHANT</span><span style={{textAlign:"right"}}>AMOUNT</span><span style={{textAlign:"right"}}>SCORE</span><span style={{textAlign:"right"}}>ACTION</span>
+          </div>
+          {feed.map(t=>{const a=t.score<20?"ALLOW":t.score<40?"MONITOR":t.score<60?"SOFT BLOCK":t.score<80?"CHALLENGE":"BLOCK",ac=t.score<20?C.green:t.score<40?C.cyan:t.score<60?C.yellow:t.score<80?C.orange:C.red;
+            return <div key={t.id} style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr 1fr 1fr 1fr",gap:4,padding:"9px 8px",borderRadius:7,marginBottom:4,background:C.bg,border:`1px solid ${C.border}`,fontSize:11}}>
+              <span style={{color:C.muted,fontFamily:F}}>{t.id}</span><span style={{color:C.muted}}>{t.time}</span><span style={{color:C.text}}>{t.merchant}</span>
+              <span style={{textAlign:"right",fontFamily:F}}>₹{fmt(t.amount)}</span>
+              <span style={{textAlign:"right",color:t.color,fontWeight:700,fontFamily:F}}>{t.score}</span>
+              <span style={{textAlign:"right",color:ac,fontWeight:700,fontSize:9}}>{a}</span>
+            </div>;
+          })}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// MODULE 3: VC ANALYTICS
+// ══════════════════════════════════════════════════════════════
+function computeCreditScore(fin) {
+  let s=600;
+  s+=clamp((fin.revenueGrowth-.05)*200,-80,80);
+  s+=clamp((fin.ebitdaMargin-.10)*300,-80,80);
+  s+=clamp((.5-fin.dti)*150,-60,60);
+  s+=clamp((fin.currentRatio-1.5)*40,-50,50);
+  s+=clamp((fin.roe-.12)*200,-50,50);
+  s+=clamp((fin.cashRunwayMonths-12)*2,-40,40);
+  s+=clamp(fin.marketPosition*60,0,60);
+  return Math.round(clamp(s,300,900));
+}
+
+function scoreBand(s) {
+  if(s>=800)return{label:"AAA",color:C.green,inv:"STRONG BUY"};
+  if(s>=740)return{label:"AA",color:C.green,inv:"BUY"};
+  if(s>=680)return{label:"A",color:C.cyan,inv:"ACCUMULATE"};
+  if(s>=620)return{label:"BBB",color:C.yellow,inv:"HOLD"};
+  if(s>=560)return{label:"BB",color:C.orange,inv:"WATCH"};
+  if(s>=500)return{label:"B",color:C.red,inv:"AVOID"};
+  return{label:"CCC",color:"#cc0000",inv:"DO NOT INVEST"};
+}
+
+function econPhase(g,inf,r){
+  if(g>2&&inf<4&&r==="low")return{phase:"EXPANSION",color:C.green,desc:"High growth, low rates — ideal for lending"};
+  if(g>2&&inf>5)return{phase:"OVERHEATING",color:C.yellow,desc:"Growth with inflation — tighten underwriting"};
+  if(g<0)return{phase:"CONTRACTION",color:C.red,desc:"Negative growth — raise provisions"};
+  if(g<2&&r==="high")return{phase:"STAGFLATION",color:C.orange,desc:"Low growth + high rates — stress test portfolios"};
+  if(g>0&&g<=2&&inf<4)return{phase:"RECOVERY",color:C.cyan,desc:"Emerging from contraction — selective deployment"};
+  return{phase:"STABLE",color:C.blue,desc:"Balanced conditions — standard underwriting"};
+}
+
+function genQtr(base,growth,noise=.08){
+  return Array.from({length:12},(_,i)=>({qtr:`Q${((i%4)+1)} ${2022+Math.floor(i/4)}`,value:base*Math.pow(1+growth,i)*(1+(Math.random()-.5)*noise)}));
+}
+
+function buildProfile(raw){
+  const d=raw||{};
+  const revenue=parseFloat(d.revenue)||120000000;
+  const prev=revenue*.82, ebitda=revenue*(parseFloat(d.ebitdaMarginPct)||14)/100, pat=ebitda*.6;
+  const totalDebt=parseFloat(d.totalDebt)||(revenue*1.1), equity=parseFloat(d.equity)||(revenue*.8);
+  const cash=parseFloat(d.cash)||(revenue*.15), burn=revenue*.04/12;
+  const fin={revenueGrowth:(revenue-prev)/prev,ebitdaMargin:ebitda/revenue,dti:totalDebt/(revenue/12),currentRatio:parseFloat(d.currentRatio)||1.8,roe:pat/equity,cashRunwayMonths:cash/burn,marketPosition:parseFloat(d.marketPosition)||.55};
+  const cs=computeCreditScore(fin), bnd=scoreBand(cs);
+  return {
+    companyName:d.companyName||"Sample Entity",cin:d.cin||"U65999MH2017PTC000000",pan:d.pan||"AABCN0000F",
+    gstin:d.gstin||"27AABCN0000F1Z5",incorporation:d.incorporation||"2017",sector:d.sector||"Fintech",
+    stage:d.stage||"Series B",hq:d.hq||"Bengaluru, Karnataka",founders:d.founders||"—",
+    teamSize:parseInt(d.teamSize)||200,operations:d.operations||"Pan-India",website:d.website||"—",
+    revenue,prev,ebitda,pat,totalDebt,equity,cash,
+    turnover:revenue,roi:pat/equity,fin,creditScore:cs,band:bnd,
+    qtrRevenue:genQtr(prev*.7,.07,.06),qtrEbitda:genQtr(prev*.08,.09,.10),
+    qtrCashFlow:genQtr(prev*.05,.06,.12),qtrDTI:genQtr(fin.dti*.7,.03,.08),
+    sectorPE:parseFloat(d.sectorPE)||28,nps:parseInt(d.nps)||52,
+    cac:parseFloat(d.cac)||1200,ltv:parseFloat(d.ltv)||8400,
+    implied:ebitda*(parseFloat(d.sectorPE)||28)*.6,
+    arr:revenue*1.12,grossProfit:revenue*.68,opex:revenue*.54,
+    interest:totalDebt*.12,tax:pat*.25,
+  };
+}
+
+function VCAnalytics() {
+  const [vtab,setVtab]=useState("upload");
+  const [rawData,setRawData]=useState([]);
+  const [sel,setSel]=useState(0);
+  const p=rawData.length>0?buildProfile(rawData[sel]):null;
+
+  const handlePrint=()=>{
+    const el=document.getElementById("vc-report");
+    if(!el)return;
+    const w=window.open("","_blank");
+    w.document.write(`<html><head><title>Investment Report</title>
+      <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet"/>
+      <style>*{box-sizing:border-box;margin:0;padding:0}body{background:#05080f;color:#c8d8f0;font-family:'JetBrains Mono',monospace;padding:32px;-webkit-print-color-adjust:exact;print-color-adjust:exact}@media print{@page{size:A4;margin:15mm}}</style>
+      </head><body>${el.innerHTML}</body></html>`);
+    w.document.close(); setTimeout(()=>{w.focus();w.print();},800);
+  };
+
+  const VTABS=[{id:"upload",l:"Data Upload",icon:"📂",c:C.blue},{id:"kyc",l:"KYC & Profile",icon:"🪪",c:C.cyan},{id:"financials",l:"Financials",icon:"📊",c:C.green},{id:"econ",l:"Economic Cycle",icon:"🌍",c:C.yellow},{id:"report",l:"VC Report",icon:"📋",c:C.gold},{id:"batch",l:"Batch Analysis",icon:"🗂️",c:C.purple}];
+
+  return (
+    <div>
+      <div style={{display:"flex",gap:3,marginBottom:18,borderBottom:`1px solid ${C.border}`,overflowX:"auto"}}>
+        {VTABS.map(t=><button key={t.id} onClick={()=>setVtab(t.id)} style={{display:"flex",alignItems:"center",gap:6,padding:"8px 14px",border:"none",background:"transparent",cursor:"pointer",whiteSpace:"nowrap",color:vtab===t.id?t.c:C.muted,fontFamily:F,fontSize:10,letterSpacing:".06em",borderBottom:`2px solid ${vtab===t.id?t.c:"transparent"}`,borderTop:"2px solid transparent",transition:"all .2s"}}>
+          <span>{t.icon}</span><span style={{fontWeight:vtab===t.id?700:400}}>{t.l.toUpperCase()}</span>
+        </button>)}
+      </div>
+
+      {rawData.length>1&&["kyc","financials","report","batch"].includes(vtab)&&(
+        <div style={{display:"flex",gap:8,marginBottom:20,flexWrap:"wrap"}}>
+          {rawData.map((c,i)=>{const pp=buildProfile(c),active=sel===i;return(
+            <button key={i} onClick={()=>setSel(i)} style={{padding:"8px 14px",borderRadius:9,border:`1px solid ${active?pp.band.color+"66":C.border}`,background:active?`${pp.band.color}12`:C.panel,color:active?pp.band.color:C.muted,fontFamily:F,fontSize:10,cursor:"pointer",transition:"all .2s"}}>
+              <div style={{fontWeight:active?700:400}}>{pp.companyName}</div>
+              <div style={{fontSize:8,opacity:.7,marginTop:2}}>{pp.band.label} · {pp.creditScore}</div>
+            </button>);})}
+        </div>
+      )}
+
+      {vtab==="upload"&&<UploadTab rawData={rawData} setRawData={setRawData} setSel={setSel} setVtab={setVtab}/>}
+      {vtab==="kyc"&&p&&<KYCTab p={p}/>}
+      {vtab==="financials"&&p&&<FinTab p={p}/>}
+      {vtab==="econ"&&<EconTab/>}
+      {vtab==="report"&&p&&<VCReportTab p={p} onPrint={handlePrint}/>}
+      {vtab==="batch"&&rawData.length>0&&<BatchTab companies={rawData}/>}
+      {["kyc","financials","report","batch"].includes(vtab)&&rawData.length===0&&(
+        <div style={{textAlign:"center",padding:"60px 20px"}}>
+          <div style={{fontSize:32,marginBottom:16}}>📂</div>
+          <div style={{fontSize:14,color:C.muted,marginBottom:12}}>No data loaded yet</div>
+          <button onClick={()=>setVtab("upload")} style={{background:C.blue+"22",border:`1px solid ${C.blue}44`,borderRadius:8,padding:"9px 20px",color:C.blue,fontFamily:F,fontSize:11,cursor:"pointer"}}>→ Go to Data Upload</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function UploadTab({rawData,setRawData,setSel,setVtab}){
+  return(
+    <div>
+      <div style={{marginBottom:24}}>
+        <div style={{fontSize:18,fontWeight:700,color:C.white,marginBottom:6,fontFamily:FS}}>📂 Data Upload</div>
+        <div style={{fontSize:11,color:C.muted}}>Upload CSV, JSON, PDF, or image. CSV/JSON auto-generates KYC profiles, credit scores and VC reports.</div>
+      </div>
+      <DropZone onData={d=>{setRawData(d);setSel(0);}}/>
+      {rawData.length>0&&(
+        <div style={{background:C.panel,border:`1px solid ${C.green}33`,borderRadius:12,padding:"18px",marginBottom:20}}>
+          <div style={{fontSize:9,color:C.green,letterSpacing:".12em",marginBottom:14}}>✓ DATA LOADED — CLICK ANY TAB TO EXPLORE</div>
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(190px,1fr))",gap:8}}>
+            {rawData.map((r,i)=>{const pp=buildProfile(r);return(
+              <div key={i} onClick={()=>{setSel(i);setVtab("kyc");}} style={{background:C.bg,border:`1px solid ${pp.band.color}33`,borderRadius:9,padding:"12px",cursor:"pointer",transition:"all .2s"}}
+                onMouseEnter={e=>e.currentTarget.style.borderColor=pp.band.color+"77"} onMouseLeave={e=>e.currentTarget.style.borderColor=pp.band.color+"33"}>
+                <div style={{fontSize:11,color:C.white,fontWeight:600}}>{pp.companyName}</div>
+                <div style={{fontSize:9,color:C.muted,marginTop:3}}>{pp.sector} · {pp.stage}</div>
+                <div style={{display:"flex",justifyContent:"space-between",marginTop:8,alignItems:"center"}}><Tag text={pp.band.label} color={pp.band.color}/><span style={{fontSize:12,color:pp.band.color,fontWeight:700,fontFamily:F}}>{pp.creditScore}</span></div>
+              </div>);})}
+          </div>
+        </div>
+      )}
+      <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px"}}>
+        <div style={{fontSize:9,color:C.muted,letterSpacing:".12em",marginBottom:12}}>SUPPORTED CSV FIELDS</div>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(180px,1fr))",gap:6}}>
+          {[["companyName","Entity name"],["cin","CIN"],["pan","PAN"],["gstin","GSTIN"],["sector","Industry"],["stage","Funding stage"],["hq","HQ location"],["founders","Founders"],["teamSize","Headcount"],["operations","Coverage"],["revenue","Annual revenue ₹"],["ebitdaMarginPct","EBITDA margin %"],["totalDebt","Total debt ₹"],["equity","Equity ₹"],["cash","Cash ₹"],["currentRatio","Current ratio"],["marketPosition","Market pos 0–1"],["nps","NPS score"],["cac","Customer CAC ₹"],["ltv","Customer LTV ₹"],["sectorPE","Sector P/E"],["incorporation","Year founded"]].map(([k,desc])=>(
+            <div key={k} style={{background:C.bg,borderRadius:6,padding:"6px 10px"}}>
+              <div style={{fontSize:9,color:C.cyan,fontFamily:F}}>{k}</div>
+              <div style={{fontSize:8,color:C.muted}}>{desc}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function KYCTab({p}){
+  const [help,setHelp]=useState(false);
+  const KV=({label,value,color=C.text,size=13,t})=>(
+    <div style={{padding:"9px 0",borderBottom:`1px solid ${C.border}`}}>
+      <div style={{fontSize:8,color:C.muted,letterSpacing:".1em",marginBottom:3,display:"flex",alignItems:"center"}}>{label}{t&&<Info text={t}/>}</div>
+      <div style={{fontSize:size,color,fontWeight:600,fontFamily:F}}>{value}</div>
+    </div>
+  );
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}><HelpBtn show={help} toggle={()=>setHelp(h=>!h)}/></div>
+      <HelpBox show={help} items={[
+        {t:"CIN",d:"Corporate Identification Number — unique ID issued by the Ministry of Corporate Affairs when a company is registered."},
+        {t:"PAN",d:"Permanent Account Number — required for tax filings and all financial transactions above ₹50,000."},
+        {t:"GSTIN",d:"GST Identification Number — indicates the entity is registered for Goods & Services Tax."},
+        {t:"Credit Score",d:"Our 300–900 internal rating. AAA = safest investment. CCC = do not invest."},
+        {t:"NPS Score",d:"Net Promoter Score — customer satisfaction measure from −100 to +100. Above 50 = excellent."},
+        {t:"LTV / CAC",d:"Lifetime Value of a customer vs Cost to Acquire them. LTV/CAC above 5x is healthy."},
+      ]}/>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:16}}>
+        <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px"}}>
+          <SecTitle icon="🪪" title="KYC IDENTITY" sub="Registered entity details"/>
+          <KV label="ENTITY NAME" value={p.companyName} color={C.white} size={15}/>
+          <KV label="CIN" value={p.cin} t="Corporate Identification Number"/>
+          <KV label="PAN" value={p.pan} t="Permanent Account Number"/>
+          <KV label="GSTIN" value={p.gstin} t="GST Identification Number"/>
+          <KV label="YEAR INCORPORATED" value={p.incorporation}/>
+          <KV label="REGISTERED OFFICE" value={p.hq}/>
+          <KV label="WEBSITE" value={p.website} color={C.blue}/>
+        </div>
+        <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px"}}>
+          <SecTitle icon="🏢" title="BUSINESS PROFILE" sub="Operations & structure"/>
+          <KV label="SECTOR / INDUSTRY" value={p.sector} color={C.cyan}/>
+          <KV label="FUNDING STAGE" value={p.stage} color={C.gold}/>
+          <KV label="FOUNDERS" value={p.founders}/>
+          <KV label="TEAM SIZE" value={`${fmt(p.teamSize)} employees`} color={C.green}/>
+          <KV label="OPERATIONS" value={p.operations}/>
+          <KV label="NPS SCORE" value={`${p.nps} / 100`} color={p.nps>50?C.green:p.nps>30?C.yellow:C.red} t="Net Promoter Score. Above 50 = excellent."/>
+          <KV label="LTV / CAC" value={`₹${fmt(p.cac)} / ₹${fmt(p.ltv)}`} color={C.cyan} t="LTV/CAC above 5x is healthy."/>
+        </div>
+        <div style={{background:C.panel,border:`2px solid ${p.band.color}44`,borderRadius:12,padding:"18px"}}>
+          <SecTitle icon="🎯" title="INTERNAL CREDIT SCORE" color={p.band.color}/>
+          <div style={{textAlign:"center",padding:"12px 0 20px"}}>
+            <div style={{fontSize:52,fontWeight:700,color:p.band.color,fontFamily:F,lineHeight:1}}>{p.creditScore}</div>
+            <div style={{fontSize:22,color:p.band.color,marginTop:6,fontFamily:F}}>{p.band.label}</div>
+            <div style={{marginTop:10}}><Tag text={p.band.inv} color={p.band.color} size={11}/></div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8}}>
+            {[{l:"Revenue Growth",v:pct(p.fin.revenueGrowth),c:p.fin.revenueGrowth>.1?C.green:C.yellow},{l:"EBITDA Margin",v:pct(p.fin.ebitdaMargin),c:p.fin.ebitdaMargin>.15?C.green:p.fin.ebitdaMargin>.08?C.yellow:C.red},{l:"DTI Ratio",v:p.fin.dti.toFixed(1)+"x",c:p.fin.dti<3?C.green:p.fin.dti<6?C.yellow:C.red},{l:"Current Ratio",v:p.fin.currentRatio.toFixed(2),c:p.fin.currentRatio>1.5?C.green:C.orange},{l:"ROE",v:pct(p.fin.roe),c:p.fin.roe>.15?C.green:C.yellow},{l:"Cash Runway",v:`${Math.round(p.fin.cashRunwayMonths)}mo`,c:p.fin.cashRunwayMonths>18?C.green:p.fin.cashRunwayMonths>9?C.yellow:C.red}].map(m=>(
+              <div key={m.l} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"7px 10px"}}>
+                <div style={{fontSize:8,color:C.muted}}>{m.l}</div>
+                <div style={{fontSize:13,color:m.c,fontWeight:700,fontFamily:F}}>{m.v}</div>
+              </div>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FinTab({p}){
+  const [help,setHelp]=useState(false);
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}><HelpBtn show={help} toggle={()=>setHelp(h=>!h)}/></div>
+      <HelpBox show={help} items={[
+        {t:"Revenue TTM",d:"Total revenue over the Trailing Twelve Months — the most recent 12 months of sales."},
+        {t:"EBITDA",d:"Earnings Before Interest, Tax, Depreciation, Amortisation. Core profitability. Above 15% margin is healthy for fintech."},
+        {t:"PAT",d:"Profit After Tax — final 'bottom line'. Can be negative for growth-stage companies."},
+        {t:"DTI",d:"Total debt ÷ monthly revenue. Above 6x = high leverage."},
+        {t:"Current Ratio",d:"Current assets ÷ current liabilities. Above 1.5 = can pay near-term bills. Below 1 = liquidity risk."},
+        {t:"Cash Runway",d:"Months before running out of cash at current burn rate. Below 9 months = critical."},
+      ]}/>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(6,1fr)",gap:10,marginBottom:16}}>
+        {[{label:"REVENUE (TTM)",value:fmtCr(p.revenue),sub:`+${pct(p.fin.revenueGrowth,1)} YoY`,color:C.green},{label:"EBITDA",value:fmtCr(p.ebitda),sub:pct(p.fin.ebitdaMargin,1)+" margin",color:C.cyan},{label:"PAT",value:fmtCr(p.pat),sub:"Net profit",color:C.blue},{label:"TOTAL DEBT",value:fmtCr(p.totalDebt),sub:`DTI: ${p.fin.dti.toFixed(1)}x`,color:C.orange},{label:"EQUITY",value:fmtCr(p.equity),sub:`ROE: ${pct(p.fin.roe,1)}`,color:C.purple},{label:"CASH",value:fmtCr(p.cash),sub:`${Math.round(p.fin.cashRunwayMonths)}mo runway`,color:C.yellow}].map(m=>(
+          <div key={m.label} style={{background:C.panel2,border:`1px solid ${m.color}22`,borderRadius:9,padding:"14px",borderTop:`2px solid ${m.color}`}}>
+            <div style={{fontSize:8,color:C.muted,letterSpacing:".1em",marginBottom:6}}>{m.label}</div>
+            <div style={{fontSize:17,fontWeight:700,color:m.color,fontFamily:F}}>{m.value}</div>
+            <div style={{fontSize:9,color:C.muted,marginTop:4}}>{m.sub}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14,marginBottom:14}}>
+        <Card title="REVENUE — LAST 12 QUARTERS"><SVGAreaChart data={p.qtrRevenue} color={C.green}/></Card>
+        <Card title="EBITDA — LAST 12 QUARTERS"><SVGBarChart data={p.qtrEbitda} color={C.cyan}/></Card>
+        <Card title="CASH FLOW — LAST 12 QUARTERS"><SVGAreaChart data={p.qtrCashFlow} color={C.blue}/></Card>
+        <Card title="DEBT-TO-INCOME RATIO — 12 QUARTERS" tooltip="Reference line at 5x is the risk threshold"><SVGLineChart data={p.qtrDTI} color={C.orange} refLine={5}/></Card>
+      </div>
+      <Card title="PROFIT & LOSS STATEMENT (TTM)" span={2}>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:24}}>
+          <div>
+            {[{l:"Revenue",v:p.revenue,c:C.green,bold:true},{l:"Cost of Revenue",v:-(p.revenue-p.grossProfit),c:C.red},{l:"Gross Profit",v:p.grossProfit,c:C.cyan,bold:true},{l:"Operating Expenses",v:-p.opex,c:C.orange},{l:"EBITDA",v:p.ebitda,c:C.cyan,bold:true},{l:"Interest Expense",v:-p.interest,c:C.red},{l:"Tax",v:-p.tax,c:C.muted},{l:"Net Profit (PAT)",v:p.pat,c:p.pat>0?C.green:C.red,bold:true}].map((row,i)=>(
+              <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"7px 10px",borderRadius:6,marginBottom:4,background:row.bold?C.dim:"transparent",border:row.bold?`1px solid ${row.c}22`:"1px solid transparent"}}>
+                <span style={{fontSize:11,color:row.bold?C.white:C.text,fontWeight:row.bold?700:400}}>{row.l}</span>
+                <span style={{fontSize:11,color:row.c,fontWeight:700,fontFamily:F}}>{fmtCr(Math.abs(row.v))}{row.v<0?" ↓":" ↑"}</span>
+              </div>
+            ))}
+          </div>
+          <div>
+            <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:14}}>KEY RATIOS</div>
+            {[{l:"Gross Margin",v:pct(p.grossProfit/p.revenue),c:C.green},{l:"EBITDA Margin",v:pct(p.fin.ebitdaMargin),c:C.cyan},{l:"PAT Margin",v:pct(p.pat/p.revenue),c:C.blue},{l:"Interest Coverage",v:`${(p.ebitda/p.interest).toFixed(1)}x`,c:p.ebitda/p.interest>3?C.green:C.red},{l:"Debt / EBITDA",v:`${(p.totalDebt/p.ebitda).toFixed(1)}x`,c:p.totalDebt/p.ebitda<5?C.green:C.orange},{l:"ROE",v:pct(p.fin.roe),c:p.fin.roe>.15?C.green:C.yellow},{l:"LTV / CAC",v:`${(p.ltv/p.cac).toFixed(1)}x`,c:p.ltv/p.cac>5?C.green:C.yellow},{l:"ARR (projected)",v:fmtCr(p.arr),c:C.cyan}].map(m=>(
+              <div key={m.l} style={{display:"flex",justifyContent:"space-between",padding:"7px 0",borderBottom:`1px solid ${C.border}`,fontSize:11}}>
+                <span style={{color:C.muted}}>{m.l}</span><span style={{color:m.c,fontWeight:700,fontFamily:F}}>{m.v}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
+function EconTab(){
+  const [gdp,setGdp]=useState(2.8),[inf,setInf]=useState(5.2),[rate,setRate]=useState("moderate");
+  const [unemp,setUnemp]=useState(7.4),[credit,setCredit]=useState(12.8);
+  const [help,setHelp]=useState(false);
+  const ep=econPhase(gdp,inf,rate);
+  const cycleData=[{phase:"Trough",gdp:-1.5,inf:2,rates:2},{phase:"Recovery",gdp:1.2,inf:3,rates:3.5},{phase:"Expansion",gdp:3.5,inf:4,rates:5},{phase:"Peak",gdp:4.2,inf:6.5,rates:6.5},{phase:"Contraction",gdp:0.5,inf:5.5,rates:5},{phase:"Current",gdp:gdp,inf:inf,rates:rate==="low"?3.5:rate==="high"?7:5.5}];
+  const riskImpact=[{metric:"PD",impact:gdp<0?"↑ +2.5pp":gdp<2?"↑ +0.8pp":"↓ –0.4pp",color:gdp<0?C.red:gdp<2?C.orange:C.green},{metric:"LGD",impact:inf>6?"↑ +3pp":inf>4?"↑ +1pp":"→ Stable",color:inf>6?C.red:inf>4?C.yellow:C.green},{metric:"ECL",impact:ep.phase==="CONTRACTION"?"↑↑ Provision":ep.phase==="EXPANSION"?"↓ Release":"→ Maintain",color:ep.phase==="CONTRACTION"?C.red:ep.phase==="EXPANSION"?C.green:C.yellow},{metric:"Fraud",impact:gdp<0?"↑ +1.8pp":"→ Stable",color:gdp<0?C.red:C.green},{metric:"Pricing",impact:rate==="high"?"↑ +200bps":rate==="low"?"↓ –150bps":"→ Unchanged",color:rate==="high"?C.orange:rate==="low"?C.cyan:C.muted}];
+  return(
+    <div>
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}}><HelpBtn show={help} toggle={()=>setHelp(h=>!h)}/></div>
+      <HelpBox show={help} items={[{t:"GDP Growth",d:"How fast the economy is growing. Above 2% = expansion. Below 0% = recession."},{t:"Inflation",d:"How fast prices are rising. 2–4% is ideal. Above 6% = central banks raise rates."},{t:"Interest Rate Environment",d:"Low = cheap loans. High = expensive loans, more defaults."},{t:"EXPANSION phase",d:"Best time to lend — low defaults, healthy incomes."},{t:"CONTRACTION phase",d:"Raise provisions, tighten underwriting."}]}/>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px"}}>
+          <SecTitle icon="🌍" title="MACRO ENVIRONMENT" sub="Adjust to stress-test risk models"/>
+          {[{label:"GDP Growth (%)",val:gdp,set:setGdp,min:-4,max:8,step:.1,color:gdp<0?C.red:gdp<2?C.yellow:C.green,t:"Annual GDP growth. Negative = recession."},{label:"Inflation (%)",val:inf,set:setInf,min:0,max:15,step:.1,color:inf>8?C.red:inf>5?C.orange:C.green,t:"Consumer price inflation. Above 6% is dangerous."},{label:"Unemployment (%)",val:unemp,set:setUnemp,min:2,max:20,step:.1,color:unemp>10?C.red:unemp>7?C.orange:C.green,t:"National unemployment. Higher = more borrowers struggling."},{label:"Credit Growth (%)",val:credit,set:setCredit,min:-5,max:30,step:.1,color:credit>20?C.orange:C.green,t:"How fast bank lending is growing year-over-year."}].map(f=>(
+            <div key={f.label} style={{marginBottom:14}}>
+              <div style={{display:"flex",justifyContent:"space-between",marginBottom:5,fontSize:10}}>
+                <span style={{color:C.muted,display:"flex",alignItems:"center"}}>{f.label}<Info text={f.t}/></span>
+                <span style={{color:f.color,fontWeight:700,fontFamily:F}}>{f.val.toFixed(1)}%</span>
+              </div>
+              <input type="range" min={f.min} max={f.max} step={f.step} value={f.val} onChange={e=>f.set(parseFloat(e.target.value))} style={{width:"100%",accentColor:f.color,cursor:"pointer"}}/>
+            </div>
+          ))}
+          <div style={{marginTop:14}}>
+            <div style={{fontSize:9,color:C.muted,marginBottom:8}}>INTEREST RATE ENVIRONMENT</div>
+            <div style={{display:"flex",gap:8}}>
+              {["low","moderate","high"].map(r=><button key={r} onClick={()=>setRate(r)} style={{flex:1,padding:"7px",borderRadius:7,border:`1px solid ${rate===r?(r==="low"?C.green:r==="high"?C.red:C.yellow)+"55":C.border}`,background:rate===r?`${r==="low"?C.green:r==="high"?C.red:C.yellow}15`:C.bg,color:rate===r?(r==="low"?C.green:r==="high"?C.red:C.yellow):C.muted,fontFamily:F,fontSize:9,cursor:"pointer",fontWeight:rate===r?700:400,textTransform:"uppercase"}}>{r}</button>)}
+            </div>
+          </div>
+        </div>
+        <div style={{background:C.panel,border:`2px solid ${ep.color}44`,borderRadius:12,padding:"18px"}}>
+          <SecTitle icon="📈" title="ECONOMIC CYCLE PHASE" color={ep.color}/>
+          <div style={{textAlign:"center",padding:"20px 0"}}>
+            <div style={{fontSize:36,fontWeight:700,color:ep.color,fontFamily:F}}>{ep.phase}</div>
+            <div style={{fontSize:11,color:C.text,marginTop:8,maxWidth:280,margin:"8px auto 0",lineHeight:1.6}}>{ep.desc}</div>
+          </div>
+          <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginTop:16}}>
+            {riskImpact.map(r=><div key={r.metric} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"8px 12px",display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{fontSize:9,color:C.muted,fontFamily:F}}>{r.metric}</span>
+              <span style={{fontSize:10,color:r.color,fontWeight:700}}>{r.impact}</span>
+            </div>)}
+          </div>
+        </div>
+      </div>
+      <Card title="ECONOMIC CYCLE — GDP vs INFLATION vs POLICY RATE">
+        <SVGGroupBar data={cycleData} keys={["gdp","inf","rates"]} colors={[C.green,C.orange,C.blue]}/>
+      </Card>
+    </div>
+  );
+}
+
+function VCReportTab({p,onPrint}){
+  const radarData=[{subject:"Rev Growth",A:clamp(p.fin.revenueGrowth*5*100,0,100)},{subject:"Profitability",A:clamp(p.fin.ebitdaMargin*6*100,0,100)},{subject:"Leverage",A:clamp((1-p.fin.dti/10)*100,0,100)},{subject:"Liquidity",A:clamp(p.fin.currentRatio/3*100,0,100)},{subject:"Team",A:clamp(p.teamSize/500*100,0,100)},{subject:"Market",A:clamp(p.fin.marketPosition*100,0,100)}];
+  const implied_ev=fmtCr(p.implied),multiple=(p.implied/p.revenue).toFixed(1);
+  return(
+    <div id="vc-report">
+      <div style={{display:"flex",justifyContent:"flex-end",marginBottom:12}} className="no-print">
+        <button onClick={onPrint} style={{background:C.gold+"22",border:`1px solid ${C.gold}55`,borderRadius:7,padding:"7px 16px",color:C.gold,fontFamily:F,fontSize:10,cursor:"pointer",fontWeight:700}}>🖨 EXPORT PDF</button>
+      </div>
+      <div style={{background:`linear-gradient(135deg,#0a1428,#060b14)`,border:`1px solid ${p.band.color}44`,borderRadius:16,padding:"24px",marginBottom:16,position:"relative",overflow:"hidden"}}>
+        <div style={{position:"absolute",top:-60,right:-60,width:200,height:200,background:`radial-gradient(circle,${p.band.color}15,transparent 70%)`,borderRadius:"50%",pointerEvents:"none"}}/>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",flexWrap:"wrap",gap:16}}>
+          <div>
+            <div style={{fontSize:9,color:C.muted,letterSpacing:".15em",marginBottom:6}}>INVESTMENT MEMORANDUM · CONFIDENTIAL</div>
+            <div style={{fontSize:24,fontWeight:700,color:C.white,fontFamily:FS}}>{p.companyName}</div>
+            <div style={{fontSize:11,color:C.muted,marginTop:4}}>{p.sector} · {p.stage} · {p.hq}</div>
+            <div style={{display:"flex",gap:8,marginTop:10,flexWrap:"wrap"}}>
+              <Tag text={p.band.inv} color={p.band.color} size={11}/><Tag text={`${p.band.label} (${p.creditScore})`} color={p.band.color}/><Tag text={p.stage} color={C.gold}/><Tag text={p.sector} color={C.blue}/>
+            </div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <div style={{fontSize:9,color:C.muted}}>IMPLIED VALUATION</div>
+            <div style={{fontSize:30,fontWeight:700,color:p.band.color,fontFamily:F}}>{implied_ev}</div>
+            <div style={{fontSize:10,color:C.muted}}>{multiple}x Revenue · {p.sectorPE}x P/E</div>
+          </div>
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}}>
+        <Card title="INVESTMENT QUALITY RADAR"><SVGRadar data={radarData} color={p.band.color} size={220}/></Card>
+        <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,alignContent:"start"}}>
+          {[{l:"Credit Score",v:`${p.creditScore}/900`,c:p.band.color},{l:"Revenue Growth",v:pct(p.fin.revenueGrowth),c:p.fin.revenueGrowth>.2?C.green:C.yellow},{l:"EBITDA Margin",v:pct(p.fin.ebitdaMargin),c:p.fin.ebitdaMargin>.15?C.green:C.yellow},{l:"LTV/CAC",v:`${(p.ltv/p.cac).toFixed(1)}x`,c:p.ltv/p.cac>5?C.green:C.orange},{l:"Cash Runway",v:`${Math.round(p.fin.cashRunwayMonths)}mo`,c:p.fin.cashRunwayMonths>18?C.green:C.orange},{l:"ROE",v:pct(p.fin.roe),c:p.fin.roe>.15?C.green:C.yellow},{l:"Implied EV",v:implied_ev,c:p.band.color},{l:"Debt/EBITDA",v:`${(p.totalDebt/p.ebitda).toFixed(1)}x`,c:p.totalDebt/p.ebitda<5?C.green:C.red}].map(m=>(
+            <div key={m.l} style={{background:C.bg,border:`1px solid ${m.c}22`,borderRadius:8,padding:"10px 12px"}}>
+              <div style={{fontSize:8,color:C.muted}}>{m.l}</div>
+              <div style={{fontSize:15,color:m.c,fontWeight:700,fontFamily:F,marginTop:3}}>{m.v}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:14}}>
+        <Card title="KEY RISK FACTORS" color={C.orange}>
+          {[{r:"Credit Risk",d:`PD: ${pct(p.creditScore<600?.18:p.creditScore<700?.08:.03,1)} · LGD: ${pct(p.fin.dti>6?.72:.55,1)}`,c:C.orange},{r:"Leverage Risk",d:`DTI ${p.fin.dti.toFixed(1)}x — ${p.fin.dti>6?"High":"Moderate"}`,c:p.fin.dti>6?C.red:C.yellow},{r:"Liquidity Risk",d:`${Math.round(p.fin.cashRunwayMonths)}mo runway — ${p.fin.cashRunwayMonths<9?"Critical":p.fin.cashRunwayMonths<18?"Watch":"Comfortable"}`,c:p.fin.cashRunwayMonths<9?C.red:C.yellow},{r:"Market Risk",d:`${p.sector} sector — regulatory & competition exposure`,c:C.muted},{r:"Execution Risk",d:`Team of ${p.teamSize} in ${p.operations}`,c:C.muted}].map(r=>(
+            <div key={r.r} style={{display:"flex",gap:10,padding:"9px 0",borderBottom:`1px solid ${C.border}`}}>
+              <div style={{width:6,height:6,borderRadius:"50%",background:r.c,marginTop:4,flexShrink:0}}/>
+              <div><div style={{fontSize:11,color:C.text,fontWeight:600}}>{r.r}</div><div style={{fontSize:9,color:C.muted,marginTop:2}}>{r.d}</div></div>
+            </div>
+          ))}
+        </Card>
+        <Card title="GROWTH CATALYSTS" color={C.green}>
+          {[{r:"Market Expansion",d:`${(p.fin.marketPosition*100)|0}% share with room to grow`,c:C.green},{r:"Revenue Quality",d:`ARR ${fmtCr(p.arr)} · ${pct(p.fin.revenueGrowth,1)} YoY`,c:C.green},{r:"Unit Economics",d:`LTV/CAC ${(p.ltv/p.cac).toFixed(1)}x — strong retention`,c:C.cyan},{r:"Digital Moat",d:`NPS ${p.nps} — loyal customer base`,c:C.blue},{r:"Team Capability",d:`${p.teamSize} employees · domain-expert founders`,c:C.purple}].map(r=>(
+            <div key={r.r} style={{display:"flex",gap:10,padding:"9px 0",borderBottom:`1px solid ${C.border}`}}>
+              <div style={{width:6,height:6,borderRadius:"50%",background:r.c,marginTop:4,flexShrink:0}}/>
+              <div><div style={{fontSize:11,color:C.text,fontWeight:600}}>{r.r}</div><div style={{fontSize:9,color:C.muted,marginTop:2}}>{r.d}</div></div>
+            </div>
+          ))}
+        </Card>
+      </div>
+    </div>
+  );
+}
+
+function BatchTab({companies}){
+  const profiles=companies.map(buildProfile);
+  return(
+    <div>
+      <div style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:10,marginBottom:16}}>
+        {[{l:"ENTITIES ANALYSED",v:companies.length,c:C.cyan},{l:"AVG CREDIT SCORE",v:Math.round(profiles.reduce((a,p)=>a+p.creditScore,0)/profiles.length),c:C.green},{l:"TOTAL REVENUE",v:fmtCr(profiles.reduce((a,p)=>a+p.revenue,0)),c:C.blue},{l:"INVEST GRADE (A+)",v:profiles.filter(p=>p.creditScore>=680).length,c:C.gold}].map(m=>(
+          <div key={m.l} style={{background:C.panel,border:`1px solid ${m.c}22`,borderRadius:9,padding:"14px",borderTop:`2px solid ${m.c}`}}>
+            <div style={{fontSize:8,color:C.muted,letterSpacing:".1em"}}>{m.l}</div>
+            <div style={{fontSize:22,fontWeight:700,color:m.c,fontFamily:F,marginTop:4}}>{m.v}</div>
+          </div>
+        ))}
+      </div>
+      <Card title="PORTFOLIO COMPARISON TABLE">
+        <div style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",gap:4,marginBottom:10,fontSize:8,color:C.muted,letterSpacing:".08em",padding:"0 8px"}}>
+          {["ENTITY","STAGE","REVENUE","EBITDA%","DTI","SCORE","GRADE","VERDICT"].map(h=><span key={h}>{h}</span>)}
+        </div>
+        {profiles.map((p,i)=>(
+          <div key={i} style={{display:"grid",gridTemplateColumns:"2fr 1fr 1fr 1fr 1fr 1fr 1fr 1fr",gap:4,padding:"10px 8px",borderRadius:8,marginBottom:6,background:C.bg,border:`1px solid ${p.band.color}18`,fontSize:11,alignItems:"center"}}>
+            <span style={{color:C.white,fontWeight:600}}>{p.companyName}</span>
+            <Tag text={p.stage} color={C.gold}/>
+            <span style={{color:C.green,fontFamily:F}}>{fmtCr(p.revenue)}</span>
+            <span style={{color:p.fin.ebitdaMargin>.15?C.green:C.yellow,fontFamily:F}}>{pct(p.fin.ebitdaMargin,1)}</span>
+            <span style={{color:p.fin.dti<4?C.green:p.fin.dti<7?C.orange:C.red,fontFamily:F}}>{p.fin.dti.toFixed(1)}x</span>
+            <span style={{color:p.band.color,fontFamily:F,fontWeight:700}}>{p.creditScore}</span>
+            <Tag text={p.band.label} color={p.band.color}/>
+            <Tag text={p.band.inv} color={p.band.color}/>
+          </div>
+        ))}
+      </Card>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// MODULE 4: FORENSIC AUDITING (AI-POWERED)
+// ══════════════════════════════════════════════════════════════
+
+const FORENSIC_DOC_TYPES = [
+  { id:"property",   label:"Property Document",    icon:"🏠", color:C.cyan,   exts:["pdf","jpg","jpeg","png"],  desc:"Sale deed, title deed, registration certificate, encumbrance certificate" },
+  { id:"fee",        label:"Fee / Payment Receipt", icon:"🧾", color:C.green,  exts:["pdf","jpg","jpeg","png"],  desc:"Stamp duty receipt, registration fees, any payment receipts" },
+  { id:"bank",       label:"Bank Statement",        icon:"🏦", color:C.blue,   exts:["pdf","csv","xlsx"],        desc:"Bank account statements, transaction history" },
+  { id:"legal",      label:"Legal Document",        icon:"⚖️", color:C.yellow, exts:["pdf","jpg","jpeg","png"],  desc:"Court orders, legal notices, affidavits, NOCs, power of attorney" },
+  { id:"identity",   label:"Identity / KYC",        icon:"🪪", color:C.purple, exts:["pdf","jpg","jpeg","png"],  desc:"Aadhaar, PAN card, passport of buyer/seller" },
+  { id:"other",      label:"Other Document",        icon:"📄", color:C.muted,  exts:["pdf","jpg","jpeg","png","csv","xlsx"], desc:"Any other supporting document" },
+];
+
+const FORENSIC_ANALYSES = [
+  { id:"legal_opinion", label:"Legal Opinion",       icon:"⚖️",  color:C.cyan,   desc:"Title clarity, encumbrance check, legal standing" },
+  { id:"case_check",    label:"Case / Dispute Check",icon:"🔍",  color:C.yellow, desc:"Detect litigation risks, disputes, red flags" },
+  { id:"expense_calc",  label:"Expense Calculator",  icon:"💰",  color:C.green,  desc:"Stamp duty, registration, hidden fees analysis" },
+  { id:"fraud_detect",  label:"Fraud Detection",     icon:"🚨",  color:C.red,    desc:"Forgery, inconsistencies, suspicious patterns" },
+  { id:"full_audit",    label:"Full Forensic Audit", icon:"🔬",  color:C.gold,   desc:"Comprehensive analysis across all dimensions" },
+];
+
+function ForensicAuditModule() {
+  const [docs, setDocs]         = useState([]);   // {id, type, name, ext, base64, size, text}
+  const [ftab, setFtab]         = useState("upload");
+  const [results, setResults]   = useState({});    // {analysisId: {status, content, ts}}
+  const [running, setRunning]   = useState(null);
+  const [activeRes, setActiveRes] = useState(null);
+  const [expSummary, setExpSummary] = useState(null);
+  const dragRef = useRef({});
+
+  // ── File reader helper ──
+  const readFile = (file) => new Promise((resolve) => {
+    const ext = file.name.split(".").pop().toLowerCase();
+    const isText = ["csv","xlsx","xls"].includes(ext);
+    if (isText) {
+      const reader = new FileReader();
+      reader.onload = e => resolve({ text: e.target.result, base64: null });
+      reader.readAsText(file);
+    } else {
+      const reader = new FileReader();
+      reader.onload = e => {
+        const b64 = e.target.result.split(",")[1];
+        resolve({ base64: b64, text: null });
+      };
+      reader.readAsDataURL(file);
+    }
+  });
+
+  const addDoc = async (file, typeId) => {
+    const ext = file.name.split(".").pop().toLowerCase();
+    const { base64, text } = await readFile(file);
+    const doc = {
+      id: Date.now() + Math.random(),
+      type: typeId,
+      name: file.name,
+      ext,
+      base64,
+      text,
+      size: (file.size / 1024).toFixed(1) + " KB",
+    };
+    setDocs(prev => [...prev, doc]);
+  };
+
+  const removeDoc = (id) => setDocs(prev => prev.filter(d => d.id !== id));
+
+  // ── Build message content from docs ──
+  const buildDocContent = () => {
+    return docs.map(d => {
+      const dtype = FORENSIC_DOC_TYPES.find(t => t.id === d.type);
+      if (d.base64 && ["jpg","jpeg","png","gif","webp"].includes(d.ext)) {
+        return {
+          type: "image",
+          source: { type: "base64", media_type: `image/${d.ext === "jpg" ? "jpeg" : d.ext}`, data: d.base64 },
+          _label: `[${dtype?.label}: ${d.name}]`
+        };
+      }
+      if (d.base64 && d.ext === "pdf") {
+        return {
+          type: "document",
+          source: { type: "base64", media_type: "application/pdf", data: d.base64 },
+          _label: `[${dtype?.label}: ${d.name}]`
+        };
+      }
+      return {
+        type: "text",
+        text: `[${dtype?.label}: ${d.name}]\n${d.text || "(binary file — use metadata only)"}`,
+      };
+    });
+  };
+
+  // ── AI call ──
+  const runAnalysis = async (analysisId) => {
+    if (!docs.length) return;
+    setRunning(analysisId);
+    setActiveRes(analysisId);
+
+    const analysis = FORENSIC_ANALYSES.find(a => a.id === analysisId);
+    const docLabels = docs.map(d => {
+      const dtype = FORENSIC_DOC_TYPES.find(t => t.id === d.type);
+      return `• ${dtype?.label}: ${d.name} (${d.size})`;
+    }).join("\n");
+
+    const systemPrompt = `You are a senior Indian legal and financial forensic expert specialising in property law, document verification, financial fraud detection, and real estate due diligence under Indian law (Transfer of Property Act, Registration Act, Stamp Act, RERA, etc.).
+
+You are analyzing documents uploaded by a user for the purpose of: ${analysis?.label} — ${analysis?.desc}.
+
+Documents provided:
+${docLabels}
+
+Always structure your response with clear sections using markdown. Be specific, cite document names when referencing findings. Flag anything suspicious clearly. Use Indian legal/financial terminology. End with a Risk Assessment summary rated LOW / MEDIUM / HIGH / CRITICAL.
+
+IMPORTANT DISCLAIMER: This is an AI-assisted analysis for informational purposes only. Always consult a qualified advocate and registered valuer for final legal/financial decisions.`;
+
+    const userPrompt = getAnalysisPrompt(analysisId, docs);
+
+    try {
+      // ── DEMO MODE ──────────────────────────────────────────────────────────
+      // The Forensic AI module requires a backend proxy to securely hold the
+      // Anthropic API key. Calling the API directly from a public static site
+      // would expose credentials. This demo shows the UI & workflow; contact
+      // Weightage Labs for a live deployment with a secure backend.
+      // ───────────────────────────────────────────────────────────────────────
+      await new Promise(r => setTimeout(r, 1200)); // simulate network delay
+
+      const demoContent = `## ${analysis?.label} — Demo Mode
+
+### ⚠ AI Backend Required
+
+This analysis module uses **Claude AI (Anthropic)** to perform real forensic analysis on your uploaded documents.
+
+**Why you're seeing this:**
+The live AI feature requires a secure backend server to hold the API key safely. Exposing an API key in a public GitHub Pages site would allow anyone to use your key and incur charges.
+
+---
+
+### What this module does (in a live deployment):
+
+${getAnalysisPrompt(analysisId, docs).split("\n").filter(l => l.startsWith("##") || l.startsWith("-")).slice(0, 8).join("\n")}
+
+---
+
+### How to enable live AI analysis:
+
+1. **Deploy a backend** (Netlify Functions / Vercel / Node.js) that holds your \`ANTHROPIC_API_KEY\` as an environment variable
+2. **Update the fetch URL** in \`index.html\` to point to your backend endpoint instead of \`api.anthropic.com\` directly
+3. **Your backend** forwards the request to Anthropic with the key in the header
+
+Or contact **Weightage Labs** for a fully hosted version with live AI.
+
+---
+
+### Documents uploaded (ready for live analysis):
+${docLabels}
+
+---
+
+## Risk Assessment: DEMO MODE — No actual risk assessment performed
+
+*This is a demonstration platform. All other modules (Credit Risk, Fraud Detection, VC Analytics) are fully functional.*`;
+
+      setResults(prev => ({ ...prev, [analysisId]: { status: "done", content: demoContent, ts: new Date().toLocaleTimeString() } }));
+
+      if (analysisId === "expense_calc") {
+        parseExpenses(demoContent);
+      }
+    } catch (err) {
+      setResults(prev => ({ ...prev, [analysisId]: { status: "error", content: `Error: ${err.message}`, ts: new Date().toLocaleTimeString() } }));
+    } finally {
+      setRunning(null);
+    }
+  };
+
+  const parseExpenses = (text) => {
+    // Extract numbers from AI response to build expense summary
+    const lines = text.split("\n").filter(l => l.match(/₹|lakh|crore|\d+,\d+|\bfee\b|\bduty\b|\bcharge\b/i));
+    setExpSummary(lines.slice(0, 10));
+  };
+
+  const runAll = async () => {
+    for (const a of FORENSIC_ANALYSES.filter(a => a.id !== "full_audit")) {
+      await runAnalysis(a.id);
+    }
+    await runAnalysis("full_audit");
+  };
+
+  const getRiskColor = (text) => {
+    if (!text) return C.muted;
+    const t = text.toUpperCase();
+    if (t.includes("CRITICAL")) return C.red;
+    if (t.includes("HIGH")) return C.orange;
+    if (t.includes("MEDIUM")) return C.yellow;
+    if (t.includes("LOW")) return C.green;
+    return C.muted;
+  };
+
+  const getRiskLabel = (text) => {
+    if (!text) return "PENDING";
+    const t = text.toUpperCase();
+    if (t.includes("CRITICAL")) return "CRITICAL";
+    if (t.includes("HIGH RISK") || t.includes("HIGH")) return "HIGH";
+    if (t.includes("MEDIUM")) return "MEDIUM";
+    if (t.includes("LOW RISK") || t.includes("LOW")) return "LOW";
+    return "ANALYSED";
+  };
+
+  const FTABS = [
+    {id:"upload", l:"Upload Docs",   icon:"📂"},
+    {id:"analyze",l:"AI Analysis",   icon:"🤖"},
+    {id:"results",l:"Findings",      icon:"📋"},
+    {id:"expenses",l:"Expenses",     icon:"💰"},
+    {id:"report", l:"Full Report",   icon:"🔬"},
+  ];
+
+  return (
+    <div>
+      {/* Sub-tab nav */}
+      <div style={{display:"flex",gap:3,marginBottom:20,borderBottom:`1px solid ${C.border}`,overflowX:"auto"}}>
+        {FTABS.map(t=>(
+          <button key={t.id} onClick={()=>setFtab(t.id)} style={{display:"flex",alignItems:"center",gap:6,padding:"8px 16px",border:"none",background:"transparent",cursor:"pointer",whiteSpace:"nowrap",color:ftab===t.id?C.gold:C.muted,fontFamily:F,fontSize:10,letterSpacing:".06em",borderBottom:`2px solid ${ftab===t.id?C.gold:"transparent"}`,borderTop:"2px solid transparent",transition:"all .2s",flexShrink:0}}>
+            <span>{t.icon}</span>
+            <span style={{fontWeight:ftab===t.id?700:400}}>{t.l.toUpperCase()}</span>
+            {t.id==="results"&&Object.keys(results).length>0&&(
+              <span style={{background:C.gold+"22",border:`1px solid ${C.gold}44`,borderRadius:10,padding:"1px 6px",fontSize:8,color:C.gold}}>{Object.keys(results).length}</span>
+            )}
+          </button>
+        ))}
+        <div style={{marginLeft:"auto",display:"flex",alignItems:"center",gap:8,paddingBottom:2,paddingRight:4}}>
+          <span style={{fontSize:9,color:C.muted}}>{docs.length} doc{docs.length!==1?"s":""} loaded</span>
+          {docs.length>0&&<button onClick={runAll} disabled={!!running} style={{background:running?C.dim:C.gold+"22",border:`1px solid ${running?C.border:C.gold+"55"}`,borderRadius:7,padding:"5px 14px",color:running?C.muted:C.gold,fontFamily:F,fontSize:10,cursor:running?"not-allowed":"pointer",fontWeight:700,transition:"all .2s"}}>
+            {running?"⏳ Running…":"⚡ Run Full Audit"}
+          </button>}
+        </div>
+      </div>
+
+      {/* ── UPLOAD TAB ── */}
+      {ftab==="upload"&&(
+        <div>
+          <div style={{marginBottom:24}}>
+            <div style={{fontSize:18,fontWeight:700,color:C.white,marginBottom:6,fontFamily:FS}}>🔬 Forensic Document Auditing</div>
+            <div style={{fontSize:11,color:C.muted,lineHeight:1.7}}>Upload property documents, bank statements, fee receipts and legal papers. The AI will perform legal opinion, case/dispute checks, expense analysis and fraud detection using Claude AI.</div>
+          </div>
+
+          {/* Doc type upload zones */}
+          <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(310px,1fr))",gap:14,marginBottom:24}}>
+            {FORENSIC_DOC_TYPES.map(dtype=>(
+              <DocUploadZone key={dtype.id} dtype={dtype} onAdd={addDoc}
+                myDocs={docs.filter(d=>d.type===dtype.id)} onRemove={removeDoc}/>
+            ))}
+          </div>
+
+          {/* Loaded docs summary */}
+          {docs.length>0&&(
+            <div style={{background:C.panel,border:`1px solid ${C.green}33`,borderRadius:12,padding:"18px"}}>
+              <div style={{fontSize:9,color:C.green,letterSpacing:".12em",marginBottom:14}}>✓ {docs.length} DOCUMENT{docs.length!==1?"S":""} READY FOR ANALYSIS</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(220px,1fr))",gap:8}}>
+                {docs.map(d=>{
+                  const dtype=FORENSIC_DOC_TYPES.find(t=>t.id===d.type);
+                  return(
+                    <div key={d.id} style={{background:C.bg,border:`1px solid ${dtype.color}33`,borderRadius:8,padding:"10px 12px",display:"flex",alignItems:"center",gap:10}}>
+                      <span style={{fontSize:18}}>{dtype.icon}</span>
+                      <div style={{flex:1,minWidth:0}}>
+                        <div style={{fontSize:10,color:C.white,fontWeight:600,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{d.name}</div>
+                        <div style={{fontSize:8,color:C.muted,marginTop:2}}>{dtype.label} · {d.size}</div>
+                      </div>
+                      <button onClick={()=>removeDoc(d.id)} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:14,padding:"0 2px",lineHeight:1}}>×</button>
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{marginTop:16,display:"flex",gap:10,flexWrap:"wrap"}}>
+                <button onClick={()=>setFtab("analyze")} style={{background:C.gold+"22",border:`1px solid ${C.gold}55`,borderRadius:8,padding:"9px 20px",color:C.gold,fontFamily:F,fontSize:11,cursor:"pointer",fontWeight:700}}>
+                  → Proceed to AI Analysis
+                </button>
+                <button onClick={runAll} disabled={!!running} style={{background:C.cyan+"22",border:`1px solid ${C.cyan}44`,borderRadius:8,padding:"9px 20px",color:C.cyan,fontFamily:F,fontSize:11,cursor:"pointer",fontWeight:600}}>
+                  ⚡ Run Full Audit Now
+                </button>
+              </div>
+            </div>
+          )}
+
+          {docs.length===0&&(
+            <div style={{background:`${C.yellow}08`,border:`1px solid ${C.yellow}22`,borderRadius:12,padding:"20px",marginTop:8}}>
+              <div style={{fontSize:11,fontWeight:700,color:C.yellow,marginBottom:10}}>💡 What documents to upload?</div>
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(240px,1fr))",gap:10}}>
+                {[
+                  {t:"For Property Due Diligence",d:"Sale deed, title deed, EC (Encumbrance Certificate), Khata, BBMP/panchayat approvals, building plan"},
+                  {t:"For Expense Calculation",d:"Registration receipt, stamp duty challan, broker invoices, home loan statements"},
+                  {t:"For Fraud Detection",d:"All of the above + ID proofs of buyer/seller, previous sale deeds, mutation documents"},
+                  {t:"For Legal Opinion",d:"All title documents + court search certificate + society NOC + bank NOC if mortgaged"},
+                ].map(({t,d})=>(
+                  <div key={t} style={{background:C.panel,borderRadius:8,padding:"12px"}}>
+                    <div style={{fontSize:10,fontWeight:700,color:C.yellow,marginBottom:4}}>{t}</div>
+                    <div style={{fontSize:9,color:C.muted,lineHeight:1.6}}>{d}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── ANALYSIS TAB ── */}
+      {ftab==="analyze"&&(
+        <div>
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:16,fontWeight:700,color:C.white,marginBottom:6,fontFamily:FS}}>🤖 AI-Powered Analysis Modules</div>
+            <div style={{fontSize:10,color:C.muted}}>{docs.length} document{docs.length!==1?"s":""} loaded · Click any module to run analysis · Results appear in the Findings tab</div>
+          </div>
+
+          {docs.length===0&&(
+            <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"40px",textAlign:"center"}}>
+              <div style={{fontSize:32,marginBottom:12}}>📂</div>
+              <div style={{fontSize:13,color:C.muted,marginBottom:12}}>Upload documents first</div>
+              <button onClick={()=>setFtab("upload")} style={{background:C.blue+"22",border:`1px solid ${C.blue}44`,borderRadius:8,padding:"9px 20px",color:C.blue,fontFamily:F,fontSize:11,cursor:"pointer"}}>→ Go to Upload</button>
+            </div>
+          )}
+
+          {docs.length>0&&(
+            <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(320px,1fr))",gap:16}}>
+              {FORENSIC_ANALYSES.map(a=>{
+                const res=results[a.id];
+                const isRunning=running===a.id;
+                const riskColor=res?getRiskColor(res.content):C.muted;
+                const riskLabel=res?getRiskLabel(res.content):"PENDING";
+                return(
+                  <div key={a.id} style={{background:C.panel,border:`2px solid ${res?a.color+"55":isRunning?a.color+"33":C.border}`,borderRadius:14,padding:"20px",transition:"all .3s",position:"relative",overflow:"hidden"}}>
+                    {isRunning&&<div style={{position:"absolute",top:0,left:0,right:0,height:2,background:`linear-gradient(90deg,transparent,${a.color},transparent)`,animation:"shimmer 1.5s infinite"}}/>}
+                    <style>{`@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(100%)}}`}</style>
+                    <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
+                      <div style={{width:40,height:40,background:`${a.color}18`,border:`1px solid ${a.color}33`,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20}}>{a.icon}</div>
+                      <div>
+                        <div style={{fontSize:13,fontWeight:700,color:C.white}}>{a.label}</div>
+                        <div style={{fontSize:9,color:C.muted,marginTop:2}}>{a.desc}</div>
+                      </div>
+                    </div>
+
+                    {res&&(
+                      <div style={{background:C.bg,border:`1px solid ${riskColor}33`,borderRadius:8,padding:"8px 12px",marginBottom:12,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                        <span style={{fontSize:9,color:C.muted}}>Risk Level</span>
+                        <span style={{fontSize:11,color:riskColor,fontWeight:700,fontFamily:F}}>{riskLabel}</span>
+                      </div>
+                    )}
+
+                    <div style={{display:"flex",gap:8}}>
+                      <button onClick={()=>runAnalysis(a.id)} disabled={!!running} style={{flex:1,background:isRunning?C.dim:`${a.color}22`,border:`1px solid ${isRunning?C.border:a.color+"44"}`,borderRadius:8,padding:"9px",color:isRunning?C.muted:a.color,fontFamily:F,fontSize:10,cursor:running?"not-allowed":"pointer",fontWeight:700,transition:"all .2s"}}>
+                        {isRunning?"⏳ Analysing…":res?"🔄 Re-run":"▶ Run Analysis"}
+                      </button>
+                      {res&&<button onClick={()=>{setActiveRes(a.id);setFtab("results");}} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"9px 14px",color:C.text,fontFamily:F,fontSize:10,cursor:"pointer"}}>View →</button>}
+                    </div>
+
+                    {res&&<div style={{fontSize:8,color:C.muted,marginTop:8,textAlign:"right"}}>Last run: {res.ts}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── RESULTS TAB ── */}
+      {ftab==="results"&&(
+        <div style={{display:"grid",gridTemplateColumns:"220px 1fr",gap:16,minHeight:400}}>
+          {/* Sidebar */}
+          <div style={{display:"flex",flexDirection:"column",gap:8}}>
+            {FORENSIC_ANALYSES.map(a=>{
+              const res=results[a.id];
+              const rc=res?getRiskColor(res.content):C.border;
+              const rl=res?getRiskLabel(res.content):"—";
+              return(
+                <button key={a.id} onClick={()=>setActiveRes(a.id)} style={{background:activeRes===a.id?`${a.color}12`:C.panel,border:`1px solid ${activeRes===a.id?a.color+"66":res?rc+"33":C.border}`,borderRadius:10,padding:"12px",cursor:"pointer",textAlign:"left",transition:"all .2s"}}>
+                  <div style={{display:"flex",alignItems:"center",gap:8,marginBottom:4}}>
+                    <span style={{fontSize:14}}>{a.icon}</span>
+                    <span style={{fontSize:10,color:activeRes===a.id?a.color:C.text,fontWeight:activeRes===a.id?700:400,fontFamily:F}}>{a.label}</span>
+                  </div>
+                  <div style={{display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+                    <span style={{fontSize:8,color:res?rc:C.muted,fontWeight:700}}>{rl}</span>
+                    {running===a.id&&<span style={{fontSize:8,color:a.color}}>⏳</span>}
+                    {!res&&running!==a.id&&<span style={{fontSize:8,color:C.dim}}>not run</span>}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Content */}
+          <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"22px",minHeight:400}}>
+            {!activeRes&&(
+              <div style={{textAlign:"center",padding:"60px 20px"}}>
+                <div style={{fontSize:32,marginBottom:12}}>🔍</div>
+                <div style={{fontSize:12,color:C.muted}}>Select an analysis from the left to view findings</div>
+              </div>
+            )}
+            {activeRes&&!results[activeRes]&&(
+              <div style={{textAlign:"center",padding:"60px 20px"}}>
+                <div style={{fontSize:32,marginBottom:12}}>{FORENSIC_ANALYSES.find(a=>a.id===activeRes)?.icon}</div>
+                <div style={{fontSize:12,color:C.muted,marginBottom:16}}>Analysis not yet run</div>
+                <button onClick={()=>runAnalysis(activeRes)} disabled={!!running} style={{background:C.cyan+"22",border:`1px solid ${C.cyan}44`,borderRadius:8,padding:"9px 20px",color:C.cyan,fontFamily:F,fontSize:11,cursor:"pointer"}}>▶ Run Now</button>
+              </div>
+            )}
+            {activeRes&&results[activeRes]&&(
+              <div>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:18}}>
+                  <div>
+                    <div style={{fontSize:14,fontWeight:700,color:C.white}}>{FORENSIC_ANALYSES.find(a=>a.id===activeRes)?.icon} {FORENSIC_ANALYSES.find(a=>a.id===activeRes)?.label}</div>
+                    <div style={{fontSize:9,color:C.muted,marginTop:3}}>Completed at {results[activeRes].ts} · {docs.length} document{docs.length!==1?"s":""} analysed</div>
+                  </div>
+                  <div style={{display:"flex",gap:8,alignItems:"center"}}>
+                    <div style={{background:`${getRiskColor(results[activeRes].content)}18`,border:`1px solid ${getRiskColor(results[activeRes].content)}44`,borderRadius:7,padding:"5px 14px"}}>
+                      <span style={{fontSize:11,fontWeight:700,color:getRiskColor(results[activeRes].content)}}>{getRiskLabel(results[activeRes].content)}</span>
+                    </div>
+                    <button onClick={()=>runAnalysis(activeRes)} disabled={!!running} style={{background:C.bg,border:`1px solid ${C.border}`,borderRadius:7,padding:"5px 12px",color:C.muted,fontFamily:F,fontSize:9,cursor:"pointer"}}>🔄 Re-run</button>
+                  </div>
+                </div>
+                <MarkdownResult content={results[activeRes].content} status={results[activeRes].status}/>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ── EXPENSES TAB ── */}
+      {ftab==="expenses"&&(
+        <div>
+          <div style={{marginBottom:20}}>
+            <div style={{fontSize:16,fontWeight:700,color:C.white,marginBottom:6,fontFamily:FS}}>💰 Expense Analysis & Calculator</div>
+            <div style={{fontSize:10,color:C.muted}}>AI-extracted expense breakdown from your uploaded documents</div>
+          </div>
+
+          {!results["expense_calc"]?(
+            <div>
+              <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"32px",textAlign:"center",marginBottom:20}}>
+                <div style={{fontSize:32,marginBottom:12}}>💰</div>
+                <div style={{fontSize:13,color:C.muted,marginBottom:16}}>{docs.length===0?"Upload documents first":"Run Expense Calculator analysis to see breakdown"}</div>
+                {docs.length>0&&<button onClick={()=>runAnalysis("expense_calc")} disabled={!!running} style={{background:C.green+"22",border:`1px solid ${C.green}44`,borderRadius:8,padding:"10px 24px",color:C.green,fontFamily:F,fontSize:11,cursor:"pointer",fontWeight:700}}>
+                  ▶ Analyse Expenses
+                </button>}
+                {docs.length===0&&<button onClick={()=>setFtab("upload")} style={{background:C.blue+"22",border:`1px solid ${C.blue}44`,borderRadius:8,padding:"10px 24px",color:C.blue,fontFamily:F,fontSize:11,cursor:"pointer"}}>→ Upload Documents</button>}
+              </div>
+              <ManualExpenseCalc/>
+            </div>
+          ):(
+            <div>
+              <div style={{background:C.panel,border:`1px solid ${C.green}33`,borderRadius:12,padding:"22px",marginBottom:16}}>
+                <MarkdownResult content={results["expense_calc"].content} status={results["expense_calc"].status}/>
+              </div>
+              <ManualExpenseCalc/>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ── FULL REPORT TAB ── */}
+      {ftab==="report"&&(
+        <div id="forensic-report">
+          <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:20}} className="no-print">
+            <div>
+              <div style={{fontSize:16,fontWeight:700,color:C.white,fontFamily:FS}}>🔬 Forensic Audit Report</div>
+              <div style={{fontSize:10,color:C.muted,marginTop:3}}>{docs.length} documents · {Object.keys(results).length} analyses completed</div>
+            </div>
+            <button onClick={()=>{const w=window.open("","_blank");w.document.write(`<html><head><title>Forensic Audit Report</title><link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600;700&display=swap" rel="stylesheet"/><style>*{box-sizing:border-box;margin:0;padding:0}body{background:#05080f;color:#c8d8f0;font-family:'JetBrains Mono',monospace;padding:32px;-webkit-print-color-adjust:exact;print-color-adjust:exact}@media print{@page{size:A4;margin:15mm}}</style></head><body>${document.getElementById("forensic-report").innerHTML}</body></html>`);w.document.close();setTimeout(()=>{w.focus();w.print();},800);}} style={{background:C.gold+"22",border:`1px solid ${C.gold}55`,borderRadius:7,padding:"7px 16px",color:C.gold,fontFamily:F,fontSize:10,cursor:"pointer",fontWeight:700}}>
+              🖨 Export PDF Report
+            </button>
+          </div>
+
+          {/* Report header */}
+          <div style={{background:`linear-gradient(135deg,#0a1428,#060b14)`,border:`1px solid ${C.gold}44`,borderRadius:16,padding:"24px",marginBottom:16,position:"relative",overflow:"hidden"}}>
+            <div style={{position:"absolute",top:-40,right:-40,width:160,height:160,background:`radial-gradient(circle,${C.gold}12,transparent 70%)`,borderRadius:"50%",pointerEvents:"none"}}/>
+            <div style={{fontSize:9,color:C.muted,letterSpacing:".15em",marginBottom:8}}>FORENSIC AUDIT REPORT · CONFIDENTIAL</div>
+            <div style={{fontSize:22,fontWeight:700,color:C.white,fontFamily:FS,marginBottom:6}}>🔬 Property & Financial Forensic Analysis</div>
+            <div style={{fontSize:10,color:C.muted,marginBottom:16}}>Generated: {new Date().toLocaleString("en-IN")} · {docs.length} documents analysed</div>
+            <div style={{display:"flex",gap:8,flexWrap:"wrap"}}>
+              {FORENSIC_ANALYSES.map(a=>{
+                const res=results[a.id];
+                if(!res) return null;
+                const rc=getRiskColor(res.content), rl=getRiskLabel(res.content);
+                return <span key={a.id} style={{fontSize:9,background:`${rc}15`,border:`1px solid ${rc}33`,borderRadius:4,padding:"3px 10px",color:rc}}>{a.icon} {a.label}: {rl}</span>;
+              })}
+              {Object.keys(results).length===0&&<span style={{fontSize:10,color:C.muted}}>No analyses run yet</span>}
+            </div>
+          </div>
+
+          {/* Documents inventory */}
+          <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px",marginBottom:16}}>
+            <div style={{fontSize:9,color:C.muted,letterSpacing:".12em",marginBottom:14}}>DOCUMENTS INVENTORY</div>
+            {docs.length===0?<div style={{fontSize:10,color:C.muted}}>No documents uploaded</div>:(
+              <div style={{display:"grid",gridTemplateColumns:"repeat(auto-fill,minmax(200px,1fr))",gap:8}}>
+                {docs.map(d=>{const dtype=FORENSIC_DOC_TYPES.find(t=>t.id===d.type);return(
+                  <div key={d.id} style={{background:C.bg,border:`1px solid ${dtype.color}22`,borderRadius:7,padding:"8px 12px",display:"flex",gap:8,alignItems:"center"}}>
+                    <span>{dtype.icon}</span>
+                    <div><div style={{fontSize:9,color:C.white,fontWeight:600}}>{d.name}</div><div style={{fontSize:8,color:C.muted}}>{dtype.label} · {d.size}</div></div>
+                  </div>
+                );})}
+              </div>
+            )}
+          </div>
+
+          {/* All results */}
+          {FORENSIC_ANALYSES.map(a=>{
+            const res=results[a.id];
+            if(!res) return null;
+            const rc=getRiskColor(res.content), rl=getRiskLabel(res.content);
+            return(
+              <div key={a.id} style={{background:C.panel,border:`1px solid ${rc}33`,borderRadius:12,padding:"18px",marginBottom:14}}>
+                <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:14}}>
+                  <div style={{fontSize:13,fontWeight:700,color:C.white}}>{a.icon} {a.label}</div>
+                  <span style={{fontSize:10,background:`${rc}18`,border:`1px solid ${rc}44`,borderRadius:5,padding:"3px 10px",color:rc,fontWeight:700}}>{rl}</span>
+                </div>
+                <MarkdownResult content={res.content} status={res.status}/>
+              </div>
+            );
+          })}
+
+          {Object.keys(results).length===0&&(
+            <div style={{textAlign:"center",padding:"40px",background:C.panel,border:`1px solid ${C.border}`,borderRadius:12}}>
+              <div style={{fontSize:32,marginBottom:12}}>🔬</div>
+              <div style={{fontSize:12,color:C.muted,marginBottom:16}}>Run analyses to generate the full report</div>
+              {docs.length>0&&<button onClick={()=>setFtab("analyze")} style={{background:C.gold+"22",border:`1px solid ${C.gold}44`,borderRadius:8,padding:"9px 20px",color:C.gold,fontFamily:F,fontSize:11,cursor:"pointer"}}>→ Go to Analysis</button>}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── DOC UPLOAD ZONE (per type) ──────────────────────────────
+function DocUploadZone({ dtype, onAdd, myDocs, onRemove }) {
+  const [drag, setDrag] = useState(false);
+  const ref = useRef();
+
+  const handle = async (file) => {
+    const ext = file.name.split(".").pop().toLowerCase();
+    if (!dtype.exts.includes(ext)) {
+      alert(`Unsupported file type .${ext} for ${dtype.label}. Accepted: ${dtype.exts.join(", ")}`);
+      return;
+    }
+    await onAdd(file, dtype.id);
+  };
+
+  return (
+    <div style={{background:C.panel,border:`1px solid ${dtype.color}22`,borderRadius:12,padding:"16px",borderTop:`2px solid ${dtype.color}`}}>
+      <div style={{display:"flex",alignItems:"center",gap:10,marginBottom:12}}>
+        <span style={{fontSize:20}}>{dtype.icon}</span>
+        <div>
+          <div style={{fontSize:11,fontWeight:700,color:C.white}}>{dtype.label}</div>
+          <div style={{fontSize:8,color:C.muted,marginTop:2}}>{dtype.desc}</div>
+        </div>
+      </div>
+
+      {/* Drop area */}
+      <div onClick={()=>ref.current.click()}
+        onDragOver={e=>{e.preventDefault();setDrag(true)}}
+        onDragLeave={()=>setDrag(false)}
+        onDrop={e=>{e.preventDefault();setDrag(false);const f=e.dataTransfer.files[0];if(f)handle(f);}}
+        style={{border:`2px dashed ${drag?dtype.color:C.border2}`,borderRadius:10,padding:"14px",textAlign:"center",background:drag?`${dtype.color}08`:C.bg,cursor:"pointer",transition:"all .2s",marginBottom:myDocs.length?10:0}}>
+        <input ref={ref} type="file" accept={dtype.exts.map(e=>"."+e).join(",")} onChange={e=>{if(e.target.files[0])handle(e.target.files[0]);e.target.value="";}} style={{display:"none"}} multiple/>
+        <div style={{fontSize:9,color:dtype.color,marginBottom:3}}>📎 Click or drop {dtype.label.toLowerCase()}</div>
+        <div style={{fontSize:8,color:C.muted}}>{dtype.exts.map(e=>"."+e.toUpperCase()).join(" · ")}</div>
+      </div>
+
+      {myDocs.map(d=>(
+        <div key={d.id} style={{display:"flex",alignItems:"center",gap:8,padding:"6px 8px",background:C.bg,borderRadius:7,marginTop:6,border:`1px solid ${dtype.color}22`}}>
+          <span style={{fontSize:12}}>📎</span>
+          <div style={{flex:1,minWidth:0}}>
+            <div style={{fontSize:9,color:C.white,overflow:"hidden",textOverflow:"ellipsis",whiteSpace:"nowrap"}}>{d.name}</div>
+            <div style={{fontSize:7,color:C.muted}}>{d.size}</div>
+          </div>
+          <button onClick={()=>onRemove(d.id)} style={{background:"none",border:"none",color:C.muted,cursor:"pointer",fontSize:12,flexShrink:0}}>×</button>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ── MARKDOWN RENDERER ──────────────────────────────────────
+function MarkdownResult({ content, status }) {
+  if (status === "error") return (
+    <div style={{background:`${C.red}10`,border:`1px solid ${C.red}33`,borderRadius:8,padding:"14px",fontSize:11,color:C.red}}>{content}</div>
+  );
+
+  // Simple markdown-to-JSX converter
+  const renderMarkdown = (text) => {
+    const lines = text.split("\n");
+    const elements = [];
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (line.startsWith("## ")) {
+        elements.push(<div key={i} style={{fontSize:13,fontWeight:700,color:C.white,marginTop:18,marginBottom:8,paddingBottom:6,borderBottom:`1px solid ${C.border}`,fontFamily:FS}}>{line.slice(3)}</div>);
+      } else if (line.startsWith("### ")) {
+        elements.push(<div key={i} style={{fontSize:11,fontWeight:700,color:C.cyan,marginTop:14,marginBottom:6}}>{line.slice(4)}</div>);
+      } else if (line.startsWith("**") && line.endsWith("**") && line.length > 4) {
+        elements.push(<div key={i} style={{fontSize:11,fontWeight:700,color:C.white,marginTop:8,marginBottom:4}}>{line.slice(2,-2)}</div>);
+      } else if (line.startsWith("- ") || line.startsWith("• ")) {
+        const txt = line.slice(2);
+        const isRisk = /risk|warn|alert|illegal|fraud|forger|discrepan|suspicious|concern|issue/i.test(txt);
+        const isGood = /clear|valid|good|approved|compliant|no issue|satisf/i.test(txt);
+        elements.push(
+          <div key={i} style={{display:"flex",gap:8,padding:"4px 0",fontSize:11}}>
+            <span style={{color:isRisk?C.red:isGood?C.green:C.muted,flexShrink:0}}>
+              {isRisk?"⚠":isGood?"✓":"•"}
+            </span>
+            <span style={{color:isRisk?C.orange:isGood?C.text:C.text,lineHeight:1.6}}>{renderInline(txt)}</span>
+          </div>
+        );
+      } else if (line.match(/^\d+\./)) {
+        elements.push(<div key={i} style={{fontSize:11,color:C.text,padding:"3px 0 3px 16px",lineHeight:1.6}}>{renderInline(line)}</div>);
+      } else if (line.startsWith("---") || line.startsWith("===")) {
+        elements.push(<hr key={i} style={{border:"none",borderTop:`1px solid ${C.border}`,margin:"12px 0"}}/>);
+      } else if (line.trim()) {
+        const isRiskLine = /CRITICAL|HIGH RISK|FRAUD DETECTED|ILLEGAL|FORGERY/i.test(line);
+        const isGoodLine = /CLEAR|NO ISSUES|VERIFIED|COMPLIANT|LOW RISK/i.test(line);
+        elements.push(<p key={i} style={{fontSize:11,color:isRiskLine?C.orange:isGoodLine?C.green:C.muted,lineHeight:1.75,marginBottom:4}}>{renderInline(line)}</p>);
+      } else {
+        elements.push(<div key={i} style={{height:6}}/>);
+      }
+      i++;
+    }
+    return elements;
+  };
+
+  const renderInline = (text) => {
+    // Bold **text**
+    const parts = text.split(/(\*\*[^*]+\*\*)/);
+    return parts.map((p, i) => {
+      if (p.startsWith("**") && p.endsWith("**")) {
+        return <strong key={i} style={{color:C.white,fontWeight:700}}>{p.slice(2,-2)}</strong>;
+      }
+      return p;
+    });
+  };
+
+  return (
+    <div style={{lineHeight:1.7}}>
+      {renderMarkdown(content)}
+    </div>
+  );
+}
+
+// ── MANUAL EXPENSE CALCULATOR ──────────────────────────────
+function ManualExpenseCalc() {
+  const [propVal, setPropVal] = useState(5000000);
+  const [state, setState]     = useState("karnataka");
+  const [gender, setGender]   = useState("male");
+  const [firstTime, setFirstTime] = useState(false);
+
+  const STATE_RATES = {
+    karnataka: { sd_m: 5.6, sd_f: 5.6, reg: 1, note: "Incl. 0.6% cess" },
+    maharashtra:{ sd_m: 6.0, sd_f: 5.0, reg: 1, note: "Women get 1% rebate" },
+    delhi:     { sd_m: 6.0, sd_f: 4.0, reg: 1, note: "Women: 4%, Men: 6%" },
+    tamilnadu: { sd_m: 7.0, sd_f: 7.0, reg: 1, note: "Flat 7% + 1% registration" },
+    telangana: { sd_m: 5.0, sd_f: 5.0, reg: 0.5, note: "0.5% registration" },
+    up:        { sd_m: 7.0, sd_f: 6.0, reg: 1, note: "Women get 1% rebate" },
+  };
+
+  const r = STATE_RATES[state] || STATE_RATES.karnataka;
+  const sdRate = gender==="female" ? r.sd_f : r.sd_m;
+  const stampDuty = propVal * sdRate / 100;
+  const regFee = propVal * r.reg / 100;
+  const gst = propVal < 4500000 ? propVal * 0.05 : 0; // GST on under-construction
+  const legalFee = Math.min(Math.max(propVal * 0.005, 5000), 50000);
+  const brokerFee = propVal * 0.01;
+  const miscFee = 5000;
+  const totalCost = propVal + stampDuty + regFee + gst + legalFee + brokerFee + miscFee;
+  const totalDuties = stampDuty + regFee + gst + legalFee + brokerFee + miscFee;
+
+  return (
+    <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"22px"}}>
+      <div style={{fontSize:11,fontWeight:700,color:C.white,marginBottom:16}}>🧮 Manual Expense Calculator</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:20}}>
+        <div>
+          <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:8}}>PROPERTY VALUE (₹)</div>
+          <input type="number" value={propVal} onChange={e=>setPropVal(Math.max(0,parseInt(e.target.value)||0))}
+            style={{width:"100%",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",color:C.white,fontFamily:F,fontSize:13,fontWeight:700}}
+            onFocus={e=>e.target.style.borderColor=C.cyan} onBlur={e=>e.target.style.borderColor=C.border}/>
+          <div style={{fontSize:10,color:C.cyan,marginTop:4}}>{fmtCr(propVal)}</div>
+        </div>
+        <div>
+          <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:8}}>STATE</div>
+          <select value={state} onChange={e=>setState(e.target.value)} style={{width:"100%",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",color:C.white,fontFamily:F,fontSize:11,cursor:"pointer"}}
+            onFocus={e=>e.target.style.borderColor=C.cyan} onBlur={e=>e.target.style.borderColor=C.border}>
+            {Object.entries(STATE_RATES).map(([k,v])=><option key={k} value={k} style={{background:C.panel}}>{k.charAt(0).toUpperCase()+k.slice(1)}</option>)}
+          </select>
+        </div>
+        <div>
+          <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:8}}>BUYER GENDER</div>
+          <div style={{display:"flex",gap:8}}>
+            {["male","female","joint"].map(g=><button key={g} onClick={()=>setGender(g)} style={{flex:1,padding:"8px",borderRadius:7,border:`1px solid ${gender===g?C.cyan+"55":C.border}`,background:gender===g?`${C.cyan}15`:C.bg,color:gender===g?C.cyan:C.muted,fontFamily:F,fontSize:10,cursor:"pointer",textTransform:"capitalize"}}>{g}</button>)}
+          </div>
+        </div>
+        <div>
+          <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:8}}>PROPERTY TYPE</div>
+          <div style={{display:"flex",gap:8}}>
+            {[["Ready-to-move","rtm"],["Under-construction","uc"]].map(([l,v])=><button key={v} onClick={()=>setFirstTime(v==="uc")} style={{flex:1,padding:"8px",borderRadius:7,border:`1px solid ${firstTime===(v==="uc")?C.cyan+"55":C.border}`,background:firstTime===(v==="uc")?`${C.cyan}15`:C.bg,color:firstTime===(v==="uc")?C.cyan:C.muted,fontFamily:F,fontSize:9,cursor:"pointer"}}>{l}</button>)}
+          </div>
+        </div>
+      </div>
+
+      <div style={{fontSize:8,color:C.muted,marginBottom:12}}>{r.note}</div>
+
+      <div style={{display:"grid",gap:6,marginBottom:16}}>
+        {[
+          {l:"Property Value",v:propVal,c:C.text,bold:true},
+          {l:`Stamp Duty (${sdRate}%)`,v:stampDuty,c:C.orange,bold:false},
+          {l:`Registration Fee (${r.reg}%)`,v:regFee,c:C.yellow,bold:false},
+          {l:firstTime?"GST (5% — under-construction)":"GST",v:firstTime?gst:0,c:C.red,bold:false,skip:!firstTime},
+          {l:"Legal / Documentation Fees (est.)",v:legalFee,c:C.muted,bold:false},
+          {l:"Broker Commission (1% est.)",v:brokerFee,c:C.muted,bold:false},
+          {l:"Misc. (franking, notary, etc.)",v:miscFee,c:C.muted,bold:false},
+          {l:"TOTAL ACQUISITION COST",v:totalCost,c:C.green,bold:true},
+          {l:"Total Duties & Fees",v:totalDuties,c:C.cyan,bold:false},
+        ].filter(row=>!row.skip).map((row,i)=>(
+          <div key={i} style={{display:"flex",justifyContent:"space-between",padding:"8px 12px",borderRadius:7,background:row.bold?C.dim:C.bg,border:`1px solid ${row.bold?row.c+"33":C.border}`}}>
+            <span style={{fontSize:11,color:row.bold?C.white:C.text,fontWeight:row.bold?700:400}}>{row.l}</span>
+            <span style={{fontSize:11,color:row.c,fontWeight:700,fontFamily:F}}>{fmtCr(row.v)}</span>
+          </div>
+        ))}
+      </div>
+
+      <div style={{background:C.bg,borderRadius:8,padding:"12px 14px",border:`1px solid ${C.green}22`}}>
+        <div style={{fontSize:9,color:C.muted,marginBottom:4}}>EFFECTIVE COST OVER PROPERTY VALUE</div>
+        <div style={{fontSize:18,color:C.green,fontWeight:700,fontFamily:F}}>{((totalDuties/propVal)*100).toFixed(2)}% overhead</div>
+        <div style={{fontSize:9,color:C.muted,marginTop:2}}>Additional ₹{fmtCr(totalDuties)} on top of property price</div>
+      </div>
+    </div>
+  );
+}
+
+// ── ANALYSIS PROMPTS ───────────────────────────────────────
+function getAnalysisPrompt(id, docs) {
+  const docList = docs.map(d=>{const t=FORENSIC_DOC_TYPES.find(x=>x.id===d.type);return `${t?.label}: ${d.name}`;}).join("\n");
+
+  const prompts = {
+    legal_opinion: `Provide a comprehensive Legal Opinion on the uploaded property documents.
+
+Analyse and cover:
+## 1. Title Clarity
+- Is the title clear and marketable?
+- Chain of ownership — any gaps?
+- Are all parties correctly identified?
+
+## 2. Encumbrance Check
+- Any mortgages, liens, or charges noted?
+- Are all previous loans/charges discharged?
+
+## 3. Document Completeness
+- Which critical documents are present/missing?
+- Registration status and validity
+
+## 4. Legal Compliance
+- Compliance with Transfer of Property Act, 1882
+- Registration Act, 1908 requirements
+- RERA applicability
+- Stamp duty compliance
+
+## 5. Red Flags
+- Any irregularities found in the documents
+- Areas requiring further verification
+
+## 6. Recommendations
+- What additional documents are needed
+- Steps before proceeding with transaction
+
+## Risk Assessment: [LOW / MEDIUM / HIGH / CRITICAL]`,
+
+    case_check: `Perform a Case & Dispute Risk Assessment on the uploaded documents.
+
+## 1. Litigation Indicators
+- Any references to court orders, injunctions, or stay orders?
+- Names of parties that may be in dispute
+- References to legal notices or arbitration
+
+## 2. Title Dispute Risk
+- Co-ownership disputes
+- Inheritance/succession conflicts
+- Boundary/encroachment issues
+
+## 3. Regulatory Non-Compliance Risk
+- RERA violations
+- Building plan deviations
+- Unauthorised construction indicators
+- BBMP/municipal approval status
+
+## 4. Financial Dispute Indicators
+- Unpaid dues, society charges, property tax arrears
+- Loan non-payment indicators
+- Developer disputes (for apartments)
+
+## 5. Suspicious Patterns
+- Repeated rapid transfers (possible hawala or money laundering)
+- Unusual price variations
+- Multiple transactions within short periods
+
+## 6. Recommended Court Searches
+- Which courts to search (civil, high court, DRT)
+- EC (Encumbrance Certificate) gaps to verify
+
+## Risk Assessment: [LOW / MEDIUM / HIGH / CRITICAL]`,
+
+    expense_calc: `Analyse all uploaded documents and extract every expense, fee, charge, and payment.
+
+## 1. Paid Amounts (Extracted from Documents)
+List every rupee amount found with:
+- Amount (₹)
+- Purpose/description
+- Date if available
+- Payee/authority
+
+## 2. Stamp Duty Analysis
+- Stamp duty paid vs. applicable rate
+- Any under/over-stamping detected
+- State-wise applicable rates
+
+## 3. Registration Fees
+- Fees paid
+- Applicable rate based on property value
+
+## 4. Bank/Loan Charges
+- Processing fees
+- EMI amounts
+- Interest payments extracted from statements
+- Pre-payment penalties if any
+
+## 5. Hidden/Unusual Charges
+- Any undisclosed fees
+- Suspicious payment patterns
+- Cash payments above ₹2 lakh (IT Act concern)
+
+## 6. Total Cost Summary
+- Total documented expenses: ₹___
+- Estimated undocumented expenses: ₹___
+- Total acquisition cost estimate: ₹___
+
+## Risk Assessment: [LOW / MEDIUM / HIGH / CRITICAL]`,
+
+    fraud_detect: `Conduct a comprehensive Fraud Detection Analysis on all uploaded documents.
+
+## 1. Document Authenticity Indicators
+- Signs of tampering, overwriting, or correction fluid
+- Font inconsistencies
+- Seal/signature irregularities
+- Date format anomalies
+
+## 2. Identity Fraud Indicators
+- Name spelling variations across documents
+- Address mismatches
+- PAN/Aadhaar number inconsistencies
+- Signature style changes
+
+## 3. Financial Fraud Patterns
+- Round-tripping or circular transactions in bank statements
+- Deposits just below suspicious transaction thresholds (structuring)
+- Salary credits inconsistent with stated income
+- Large unexplained cash deposits
+- Multiple accounts receiving same amounts
+
+## 4. Property Fraud Indicators
+- Sale consideration vs. market value discrepancy (benami)
+- Power of Attorney misuse signs
+- Duplicate or multiple mortgages
+- Fabricated chain of title
+- Forged NOCs or clearances
+
+## 5. Red Flag Score
+Rate each category: CLEAR / SUSPICIOUS / HIGH RISK
+
+## 6. Immediate Actions Required
+- What to verify with original documents
+- Which authorities to cross-check with
+
+## Risk Assessment: [LOW / MEDIUM / HIGH / CRITICAL]`,
+
+    full_audit: `Provide a COMPLETE FORENSIC AUDIT SUMMARY covering all dimensions.
+
+## EXECUTIVE SUMMARY
+2-3 sentences on overall status.
+
+## OVERALL RISK MATRIX
+| Dimension | Risk Level | Key Finding |
+(cover: Title, Legal, Financial, Fraud, Compliance)
+
+## CRITICAL FINDINGS (if any)
+Numbered list of issues that must be resolved before transaction
+
+## IMPORTANT FINDINGS
+Issues to monitor or verify
+
+## POSITIVE INDICATORS
+What checks out correctly
+
+## RECOMMENDED ACTION PLAN
+Step-by-step checklist before proceeding with property transaction
+
+## PROFESSIONALS TO ENGAGE
+- Advocate for: ___
+- Chartered Accountant for: ___
+- Registered Valuer for: ___
+
+## FINAL VERDICT
+PROCEED / PROCEED WITH CAUTION / DO NOT PROCEED
+
+## Risk Assessment: [LOW / MEDIUM / HIGH / CRITICAL]`
+  };
+
+  return prompts[id] || `Analyse the provided documents and give a detailed forensic report.`;
+}
+function ContactPage(){
+  return(
+    <div style={{maxWidth:700,margin:"0 auto",padding:"40px 0"}}>
+      <div style={{fontSize:24,fontWeight:700,color:C.white,marginBottom:8,fontFamily:FS}}>📬 Contact Us</div>
+      <div style={{fontSize:11,color:C.muted,marginBottom:32}}>Reach out for queries, partnerships, or platform access.</div>
+      <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:24}}>
+        {[{icon:"📧",label:"Email",value:"hello@weightage.ai",color:C.cyan},{icon:"🌐",label:"Website",value:"weightage.ai",color:C.blue},{icon:"💼",label:"LinkedIn",value:"/company/weightage-labs",color:C.purple},{icon:"📍",label:"Location",value:"Bengaluru, Karnataka, India",color:C.green}].map(c=>(
+          <div key={c.label} style={{background:C.panel,border:`1px solid ${c.color}22`,borderRadius:12,padding:"20px",borderTop:`2px solid ${c.color}`}}>
+            <div style={{fontSize:22,marginBottom:8}}>{c.icon}</div>
+            <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:4}}>{c.label}</div>
+            <div style={{fontSize:13,color:c.color,fontWeight:600,fontFamily:F}}>{c.value}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"24px"}}>
+        <div style={{fontSize:11,fontWeight:700,color:C.white,marginBottom:16}}>Send a Message</div>
+        <div style={{display:"grid",gap:12}}>
+          {[{label:"Your Name",ph:"Jane Smith",type:"text"},{label:"Email Address",ph:"jane@company.com",type:"email"},{label:"Subject",ph:"Partnership inquiry",type:"text"}].map(f=>(
+            <div key={f.label}>
+              <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:6}}>{f.label}</div>
+              <input type={f.type} placeholder={f.ph} style={{width:"100%",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",color:C.text,fontFamily:F,fontSize:11}}
+                onFocus={e=>e.target.style.borderColor=C.cyan} onBlur={e=>e.target.style.borderColor=C.border}/>
+            </div>
+          ))}
+          <div>
+            <div style={{fontSize:9,color:C.muted,letterSpacing:".1em",marginBottom:6}}>Message</div>
+            <textarea rows={4} placeholder="Describe what you're looking for…" style={{width:"100%",background:C.bg,border:`1px solid ${C.border}`,borderRadius:8,padding:"10px 14px",color:C.text,fontFamily:F,fontSize:11,resize:"vertical"}}
+              onFocus={e=>e.target.style.borderColor=C.cyan} onBlur={e=>e.target.style.borderColor=C.border}/>
+          </div>
+          <button style={{background:`${C.cyan}22`,border:`1px solid ${C.cyan}55`,borderRadius:8,padding:"11px 24px",color:C.cyan,fontFamily:F,fontSize:11,cursor:"pointer",fontWeight:700}}>✉ SEND MESSAGE</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function TermsPage(){
+  const secs=[{t:"1. Acceptance of Terms",d:"By accessing and using this Risk Intelligence Platform ('Platform'), you accept and agree to be bound by the terms of this agreement. This Platform is provided for demonstration and informational purposes only."},{t:"2. Disclaimer of Warranties",d:"All risk models, scores, calculations, and outputs on this Platform are for illustrative and educational purposes only. They do not constitute financial advice, credit opinions, or investment recommendations and should not be relied upon for actual lending, investment, or credit decisions."},{t:"3. Model Limitations",d:"The credit risk models (PD, LGD, EAD, ECL), fraud detection algorithms, and VC analytics models are simplified representations of real-world models. Actual institutional models are significantly more complex and subject to regulatory oversight, validation, and ongoing calibration."},{t:"4. Data Privacy",d:"Any data uploaded to this Platform is processed locally within your browser session and is not transmitted to or stored on external servers. No personally identifiable information should be uploaded. Ensure you have appropriate permissions before uploading any data."},{t:"5. Intellectual Property",d:"All risk model architectures, algorithms, UI designs, and methodologies displayed on this Platform are proprietary. Unauthorized reproduction, distribution, or commercial use is strictly prohibited."},{t:"6. Regulatory Compliance",d:"Models reference IFRS 9, Basel II/III, and RAROC frameworks for educational purposes only. Compliance with these frameworks in regulated institutions requires additional validation, regulatory approval, and professional oversight."},{t:"7. Limitation of Liability",d:"To the maximum extent permitted by applicable law, we shall not be liable for any indirect, incidental, special, or consequential damages arising from your use of this Platform."},{t:"8. Governing Law",d:"These terms are governed by the laws of India. Any disputes are subject to the exclusive jurisdiction of the courts of Bengaluru, Karnataka."},{t:"9. Changes to Terms",d:"We reserve the right to modify these terms at any time. Continued use following any changes constitutes acceptance of the revised terms."},{t:"10. Contact",d:"For questions regarding these terms, please contact us through the Contact page. Last updated: 2025."}];
+  return(
+    <div style={{maxWidth:800,margin:"0 auto",padding:"40px 0"}}>
+      <div style={{fontSize:24,fontWeight:700,color:C.white,marginBottom:8,fontFamily:FS}}>📋 Terms & Conditions</div>
+      <div style={{fontSize:11,color:C.muted,marginBottom:32}}>Please read these terms carefully before using this platform.</div>
+      <div style={{display:"grid",gap:10}}>
+        {secs.map(s=>(
+          <div key={s.t} style={{background:C.panel,border:`1px solid ${C.border}`,borderRadius:12,padding:"18px"}}>
+            <div style={{fontSize:12,fontWeight:700,color:C.cyan,marginBottom:8}}>{s.t}</div>
+            <div style={{fontSize:11,color:C.muted,lineHeight:1.8}}>{s.d}</div>
+          </div>
+        ))}
+      </div>
+      <div style={{background:`${C.green}08`,border:`1px solid ${C.green}33`,borderRadius:12,padding:"16px",marginTop:20,fontSize:10,color:C.muted,lineHeight:1.7}}>
+        <strong style={{color:C.green}}>⚖ Risk Disclosure:</strong> All models and scores are for demonstration only. This platform is not a licensed financial institution. Always consult qualified professionals before making financial decisions.
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════
+// ROOT APP
+// ══════════════════════════════════════════════════════════════
+const TICKER=[{l:"IFRS9/ECL",v:"₹1,240",c:C.orange},{l:"CREDIT/PD",v:"8.2%",c:C.yellow},{l:"FRAUD",v:"Score 34",c:C.cyan},{l:"VC/SCORE",v:"742",c:C.green},{l:"PRICING",v:"21.4%",c:C.blue},{l:"BNPL/ECL",v:"₹980",c:C.red},{l:"LGD",v:"62.1%",c:C.orange},{l:"RAROC",v:"18.4%",c:C.green}];
+const MODS=[{id:"credit",label:"Credit Risk",sub:"PD · LGD · EAD · ECL · IFRS 9",icon:"📉",color:C.blue,tag:"IFRS 9"},{id:"fraud",label:"Fraud Detection",sub:"Anomaly · Scoring · Feed",icon:"🛡️",color:C.orange,tag:"ML MODEL"},{id:"vc",label:"VC Analytics",sub:"KYC · Financials · Reports",icon:"📊",color:C.green,tag:"FINTECH"},{id:"forensic",label:"Forensic Audit",sub:"Legal · Expenses · Fraud · AI",icon:"🔬",color:C.gold,tag:"AI DEMO"}];
+const PAGES=[{id:"contact",label:"Contact",icon:"📬"},{id:"terms",label:"Terms",icon:"📋"}];
+
+function App() {
+  const [active,setActive]=useState("credit");
+  const [tick,setTick]=useState(0);
+  useEffect(()=>{const id=setInterval(()=>setTick(t=>(t+1)%TICKER.length),1800);return()=>clearInterval(id);},[]);
+  const isPage=PAGES.some(p=>p.id===active);
+  const am=MODS.find(m=>m.id===active);
+
+  return(
+    <div style={{minHeight:"100vh",background:C.bg,fontFamily:F,color:C.text,overflowX:"hidden"}}>
+      {/* TOP BAR */}
+      <div className="no-print" style={{background:"#030610",borderBottom:`1px solid ${C.border}`,padding:"0 24px",display:"flex",alignItems:"stretch",height:52,position:"sticky",top:0,zIndex:200}}>
+        {/* LOGO */}
+        <div style={{display:"flex",alignItems:"center",gap:12,paddingRight:22,borderRight:`1px solid ${C.border}`,minWidth:185,cursor:"pointer",flexShrink:0}} onClick={()=>setActive("credit")}>
+          <div style={{width:36,height:36,background:`linear-gradient(135deg,${C.cyan},${C.blue})`,borderRadius:10,display:"flex",alignItems:"center",justifyContent:"center",fontSize:20,boxShadow:`0 0 20px ${C.cyan}55`,flexShrink:0}}>⚖</div>
+          <div>
+            <div style={{fontSize:14,fontWeight:700,color:C.white,letterSpacing:".12em",lineHeight:1.1}}>WEIGHTAGE</div>
+            <div style={{fontSize:9,color:C.cyan,letterSpacing:".22em",marginTop:2}}>LABS</div>
+          </div>
+        </div>
+
+        {/* MODULE TABS */}
+        <div style={{display:"flex",alignItems:"stretch",flex:1,paddingLeft:6,overflowX:"auto"}}>
+          {MODS.map(m=><button key={m.id} onClick={()=>setActive(m.id)} style={{display:"flex",alignItems:"center",gap:8,padding:"0 16px",border:"none",background:"transparent",cursor:"pointer",borderBottom:`2px solid ${active===m.id?m.color:"transparent"}`,borderTop:"2px solid transparent",color:active===m.id?m.color:C.muted,fontFamily:F,fontSize:10,letterSpacing:".06em",transition:"all .2s",whiteSpace:"nowrap",flexShrink:0}}>
+            <span>{m.icon}</span>
+            <div style={{textAlign:"left"}}>
+              <div style={{fontWeight:active===m.id?700:400}}>{m.label.toUpperCase()}</div>
+              <div style={{fontSize:8,opacity:.6}}>{m.sub}</div>
+            </div>
+            <span style={{fontSize:8,background:`${m.color}18`,border:`1px solid ${m.color}33`,borderRadius:3,padding:"1px 5px",color:m.color,marginLeft:4}}>{m.tag}</span>
+          </button>)}
+        </div>
+
+        {/* NAV + TICKER */}
+        <div style={{display:"flex",alignItems:"center",gap:12,paddingLeft:14,borderLeft:`1px solid ${C.border}`,flexShrink:0}}>
+          {PAGES.map(p=><button key={p.id} onClick={()=>setActive(p.id)} style={{border:"none",background:"transparent",cursor:"pointer",color:active===p.id?C.cyan:C.muted,fontFamily:F,fontSize:10,padding:"4px 8px",borderRadius:6,transition:"all .2s",whiteSpace:"nowrap"}}>{p.icon} {p.label}</button>)}
+          <div style={{display:"flex",alignItems:"center",gap:12,paddingLeft:12,borderLeft:`1px solid ${C.border}`}}>
+            <span style={{fontSize:8,color:C.muted,letterSpacing:".12em"}}>LIVE</span>
+            {TICKER.slice(tick,tick+3).concat(TICKER.slice(0,Math.max(0,tick+3-TICKER.length))).map((t,i)=><div key={i} style={{display:"flex",gap:4,alignItems:"center"}}><span style={{color:C.muted,fontSize:9}}>{t.l}</span><span style={{color:t.c,fontWeight:700,fontSize:10}}>{t.v}</span></div>)}
+            <div style={{width:6,height:6,borderRadius:"50%",background:C.green,boxShadow:`0 0 8px ${C.green}`}}/>
+          </div>
+        </div>
+      </div>
+
+      {/* MODULE HEADER */}
+      {!isPage&&am&&<div className="no-print" style={{background:`linear-gradient(180deg,#0a101e,${C.bg})`,borderBottom:`1px solid ${C.border}`,padding:"12px 28px",display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div style={{display:"flex",alignItems:"center",gap:14}}>
+          <div style={{fontSize:22}}>{am.icon}</div>
+          <div>
+            <div style={{fontSize:14,fontWeight:700,color:C.white,letterSpacing:".04em"}}>{am.label.toUpperCase()}</div>
+            <div style={{fontSize:10,color:C.muted,marginTop:2}}>{am.sub}</div>
+          </div>
+          <Tag text={am.tag} color={am.color}/>
+        </div>
+        <div style={{fontSize:9,color:C.muted,textAlign:"right"}}>
+          <div style={{color:C.green}}>● MODELS LIVE</div>
+          <div style={{marginTop:2}}>{new Date().toLocaleDateString("en-IN",{day:"2-digit",month:"short",year:"numeric"})}</div>
+        </div>
+      </div>}
+
+      {/* MAIN */}
+      <div style={{padding:"20px 24px",maxWidth:1400,margin:"0 auto",paddingBottom:56}}>
+        {active==="credit"&&<CreditRiskModule/>}
+        {active==="fraud"&&<FraudModule/>}
+        {active==="vc"&&<VCAnalytics/>}
+        {active==="forensic"&&<ForensicAuditModule/>}
+        {active==="contact"&&<ContactPage/>}
+        {active==="terms"&&<TermsPage/>}
+      </div>
+
+      {/* STATUS BAR */}
+      <div className="no-print" style={{position:"fixed",bottom:0,left:0,right:0,background:"#030508",borderTop:`1px solid ${C.border}`,padding:"5px 24px",display:"flex",justifyContent:"space-between",fontSize:9,color:C.muted,zIndex:100}}>
+        <div style={{display:"flex",gap:18}}>
+          <span style={{color:C.cyan}}>RISK INTELLIGENCE PLATFORM · v2.0</span>
+          <span style={{color:C.green}}>● CREDIT RISK · FRAUD · VC ANALYTICS</span>
+          <span>IFRS 9 · BASEL II/III · RAROC</span>
+        </div>
+        <div style={{display:"flex",gap:18,alignItems:"center"}}>
+          <span>For demonstration purposes only</span>
+          <span style={{color:C.gold}}>PDF Export Ready</span>
+          <button onClick={()=>setActive("terms")} style={{border:"none",background:"transparent",color:C.muted,fontFamily:F,fontSize:9,cursor:"pointer"}}>Terms</button>
+          <button onClick={()=>setActive("contact")} style={{border:"none",background:"transparent",color:C.muted,fontFamily:F,fontSize:9,cursor:"pointer"}}>Contact</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App/>);
+</script>
+</body>
+</html>
